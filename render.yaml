@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: property-lease
+    env: node
+    region: frankfurt  # 欧洲节点，国内访问较快
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_MODE
+        value: cloud
+      - key: ATT_STORAGE
+        value: qiniu
+      - key: QINIU_REGION
+        value: z0
+      # TiDB 和七牛配置通过 Secret 设置
+      - key: DATABASE_URL
+        sync: false
+      - key: QINIU_ACCESS_KEY
+        sync: false
+      - key: QINIU_SECRET_KEY
+        sync: false
+      - key: QINIU_BUCKET
+        sync: false
+      - key: QINIU_DOMAIN
+        sync: false

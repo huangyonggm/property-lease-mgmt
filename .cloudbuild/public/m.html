@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>物业租赁 - 移动端</title>
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body class="m-body">
+<div id="mApp"></div>
+
+<div id="mLogin" class="login-page" style="display:none">
+  <div class="login-box" style="width:330px">
+    <div class="login-brand">
+      <div class="login-logo">租</div>
+      <div><h1>物业租赁移动端</h1><p>巡检 · 抄表 · 待办 · 提醒</p></div>
+    </div>
+    <form id="mLoginForm">
+      <label>账号</label><input type="text" id="mUser" value="gongcheng">
+      <label>密码</label><input type="password" id="mPwd" value="123456">
+      <button type="submit" class="btn btn-primary btn-block">登 录</button>
+      <div class="login-tip">建议使用工程/客服账号登录；<a href="/">切换到 PC 端</a></div>
+    </form>
+  </div>
+</div>
+
+<div id="mContent" style="display:none">
+  <div class="m-head">
+    <div class="t" id="mTitle">移动工作台</div>
+    <div class="s" id="mSub">加载中…</div>
+  </div>
+  <div class="m-stat" id="mStat"></div>
+  <div id="mBody"></div>
+  <div class="m-tabbar">
+    <div class="t on" data-t="todo"><span class="ic">📋</span>待办</div>
+    <div class="t" data-t="patrol"><span class="ic">🔍</span>巡检</div>
+    <div class="t" data-t="meter"><span class="ic">⚡</span>抄表</div>
+    <div class="t" data-t="remind"><span class="ic">🔔</span>提醒</div>
+  </div>
+</div>
+
+<script src="/js/core.js"></script>
+<script src="/js/mobile.js"></script>
+</body>
+</html>

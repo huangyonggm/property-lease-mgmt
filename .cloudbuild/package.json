@@ -1,0 +1,22 @@
+{
+  "name": "property-lease-management",
+  "version": "1.0.0",
+  "description": "物业不动产租赁管理系统（合同/房源/收费/发票/审批/工单/钉钉对接/报表）",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node scripts/reseed.js",
+    "schema": "node scripts/gen_schema.js",
+    "migrate": "node scripts/migrate_to_cloud.js --all",
+    "db:check": "node scripts/migrate_to_cloud.js --check"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@tidbcloud/serverless": "^0.3.0",
+    "qiniu": "^7.15.2",
+    "xlsx": "^0.18.5"
+  }
+}

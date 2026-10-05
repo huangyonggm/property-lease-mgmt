@@ -1,0 +1,30 @@
+# ===== 绝不提交：含真实业务数据与密钥 =====
+# 本目录下的数据文件是公司真实业务数据（客户身份证、工资、合同金额）
+data/
+uploads/
+exports/
+backups/
+screenshots/
+
+# 含 DATABASE_URL 数据库密码、QINIU_SECRET_KEY 云密钥
+.env
+.env.*
+!.env.example
+
+# 依赖与构建产物
+node_modules/
+.netlify/
+dist/
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
+.tmp/
+.verify_tmp/

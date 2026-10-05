@@ -1,0 +1,121 @@
+[build]
+  # 部署基准目录必须是本项目目录。
+  # 实测不加这一行时，Netlify CLI 会把基准目录误判成 Y:\ 盘根目录 ——
+  # 打出来的 api.zip 里居然包含「梦想之城物业管理系统/局部小工具/.../*.xls」
+  # 和本项目的 data/ 全部数据文件。显式声明 base 后才对。
+  base = "."
+  # 站点根必须是 public/，绝不能是 "."。
+  # 若发布整个仓库，data/*.json（合同、客户、工资等敏感数据）
+  # 会以静态资源形式被任何人直接下载，等于数据裸奔。
+  publish = "public"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+  # 数据库 / 密钥 / 七牛云全部在 Netlify 控制台 Environment variables 中设置。
+  # 必填：DATABASE_URL、APP_SECRET
+  # 附件：ATT_STORAGE=qiniu 时需 QINIU_ACCESS_KEY / QINIU_SECRET_KEY / QINIU_BUCKET / QINIU_DOMAIN
+  #
+  # QINIU_REGION 这里给一份兜底默认值。实测 Netlify 控制台上的变量值
+  # 是密文、CLI env:set 在本机会静默失败（无输出、无退出码），
+  # 很难确认线上到底生效没生效，所以把「空间真实所在区域」固化在 toml 里。
+  #
+  # ⚠ 值必须是**实测探测出来的真实区域**，不能凭创建时选的填。
+  #   探测方法：对一个不存在的 key 逐区 stat，返回 "no such file" 即区域正确，
+  #   返回 error_code=IncorrectZone 即区域错误。
+  #   node scripts/test_qiniu_config.js --live 会自动跑这个探测。
+  #   空间 property-lease 实测在 z0（华东），不是当初建空间时选的 z2。
+  # 区域写错的后果：upload 会因七牛自动重定向而侥幸成功，掩盖问题；
+  #   但 stat / delete / 改 ACL 走 rsHost，会直接报 IncorrectZone。
+  # 控制台上的同名变量优先级高于此处，改这里只作兜底。
+  QINIU_REGION = "z0"
+
+[functions]
+  # nft 打包：按运行时实际可达的 require 追踪依赖。
+  # 保留 @tidbcloud/serverless 与 qiniu 的真实文件（不做 esbuild 内联），避免线上找不到模块。
+  node_bundler = "nft"
+
+# ------------------------------------------------------------------
+# 函数打包白名单（性能 + 安全，两条都重要）
+# ------------------------------------------------------------------
+# 【为什么要显式白名单 —— 不是优化，是修 bug】
+# 默认 nft 会把「项目根目录下被静态引用的一切」都打进函数包。
+# 实测打出来的 api.zip 解压后有 79.77MB / 457 个文件，其中：
+#   14.1 MB  exports/_schema_probe.json
+#    3.6 MB  data/_migrate_backup/attendance.json   （迁移备份）
+#    3.5 MB  data/attendance.json                    （考勤）
+#    1.9 MB  data/workorders.json
+#    1.5 MB  data/bills.json
+#    1.0 MB  梦想之城物业管理系统/局部小工具/.../维序巡查记录7月.xls  ← 连隔壁项目的原始文件都进来了
+#   若干 972KB 的 uploads/*.xls
+#
+# 后果一（性能）：Lambda 每次唤醒要解压 ~80MB，冷启动实测 17~20 秒，
+#   期间所有请求排队，Netlify 函数 30 秒上限下频繁 502/504。
+# 后果二（安全，更严重）：data/ 下有 customers.json（客户信息）、
+#   employees.json（工资）、payrolls.json（工资表）、contracts.json（合同），
+#   这些**本地数据文件被一并部署到公网函数包里**。虽然 Lambda 文件系统
+#   不能被公网直接下载，但依赖包出现在构建产物里就是不该有的暴露面。
+#
+# 解决方式：不用 included_files（实测在 nft 模式下不可靠 —— 它会连
+# nft 追踪出的 lib/、routes/ 一起排除，打出缺业务代码的包），
+# 改用 scripts/prepare_cloud_build.js 把「云端真正需要的文件」物理收集到
+# .cloudbuild/，然后 deploy 直接指向那个干净目录。
+# 不需要的数据压根不在那里，物理上不可能被打包。
+#
+# 必须用「--dir=.cloudbuild/public --functions=.cloudbuild/netlify/functions」部署，
+# 或先跑 node scripts/prepare_cloud_build.js 再 deploy。
+#
+# 附带好处：函数包 80.5MB → 约 2.4MB，Lambda 冷启动 17~20 秒显著改善。
+[functions."api"]
+  # 兜底：即使将来有人直接指向项目根部署，这些目录也绝不能进包
+  excluded_files = [
+    "data/**",
+    "uploads/**",
+    "exports/_schema_probe.json",
+    "exports/*.xls",
+    "exports/*.csv",
+    "scripts/**",
+    ".tmp_*.js",
+    "**/*.json.gz",
+  ]
+
+  # ---- 冷启动说明（实测数据，别随便调大）----
+  # 已在代码层根治的四层（详见 lib/clouddb.js 注释）：
+  #   1. single-flight 并发去重 —— 房源列表 638 条 SQL → 3 条
+  #   2. client 复用 —— 消除每条 SQL 一次 TLS 握手
+  #   3. 等值条件下推 + page() LIMIT 修复 —— 全表拉取 8.1 秒 → 81 毫秒
+  #   4. 小表永久缓存 —— 消除 TTL 到期后的周期性击穿
+  # 剩余的冷启动波动来自平台（Lambda 回收 + TiDB Serverless 空闲休眠），
+  # 代码层无法根治。包体从 80MB 降到 2.4MB 后已明显缓解。
+  # 首屏「闲置后第一次点开特别慢」的根治手段是下面的定时预热函数。
+
+# ---- 定时预热（已启用）----
+# 单独的 warmup 函数每 5 分钟：① 直连 TiDB 打一发 SELECT 1（唤醒数据库，
+# 这是首屏 10~30 秒的大头）② HTTP 打一发线上 /api/warmup（唤醒 api Lambda
+# 并把常用表预热进它的跨请求共享缓存）。
+# 为什么不直接给 api 挂 schedule：定时触发的 event.path 是函数根路径，落不到
+# api.js 里的 /api/warmup 分支，会变成「Lambda 醒了、数据库没醒」，等于没预热。
+# 配额：*/5 → 约 8640 次/月，远低于免费额度 12.5 万次/月。
+[functions.warmup]
+  schedule = "*/5 * * * *"
+
+# ---------- 路由 ----------
+# /api/* 交给 Function；其余走 public/ 下的静态资源。
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# SPA 回退：前端是 hash 路由，但直接访问子路径也要能返回 index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "SAMEORIGIN"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
