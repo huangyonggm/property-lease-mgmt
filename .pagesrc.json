@@ -1,5 +1,8 @@
 {
   "framework": null,
   "build_command": "echo 'No build required'",
-  "build_output_dir": "public"
+  "build_output_dir": "public",
+  "build_environment": {
+    "CF_PAGES_FRAMEWORK_DETECTION": "false"
+  }
 }
