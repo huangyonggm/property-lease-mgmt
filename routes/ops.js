@@ -8,6 +8,7 @@ const path = require('path');
 const { uid, num, now, today, addDays, monthOf, money } = require('../lib/util');
 const { floorNameOf } = require('../lib/billing');
 const { AttStore } = require('../lib/attstore');
+const OCR = require('../lib/ocr');
 
 module.exports = function (db, router, opt) {
   opt = opt || {};
@@ -205,8 +206,29 @@ module.exports = function (db, router, opt) {
       storage: stored.storage, size: buf.length,
       bizType: b.bizType || '', bizId: b.bizId || '', by: (req.u || {}).name || '', time: now()
     };
-    await db.insert('attachments', rec);
-    ok(res, rec);
+    // 用 insert 的返回值（含生成的 id / createTime）作为响应体。
+    // 原来直接返回上面的 rec —— rec 里没有 id（id 是 db.insert 内部生成的），
+    // 前端只能拿到 url/name，后续想按 id 删除/引用这条附件记录就无从下手。
+    const saved = await db.insert('attachments', rec);
+
+    // ---- 发票附件：上传即自动识别 ----
+    // bizType='invoice' 时调腾讯云增值税发票专用 OCR，识别结果原样放在响应的
+    // 顶层 `ocr` 字段（**不塞进 rec**：rec 会被前端存进发票的 attachments 数组，
+    // 把识别中间结果一起持久化进去是脏数据）。前端拿到后用 fillInvoiceFromOcr 回填表单。
+    //
+    // 失败处理：`ocr_error` 只作提示，**附件本身照常上传成功** ——
+    // OCR 是增强能力，不是前置依赖；税率识别不准、图片不是发票版式、
+    // 甚至根本没配凭据，都不该让「把发票传上来存档」这件基本的事做不成。
+    let extra = null;
+    if (String(b.bizType || '') === 'invoice') {
+      try {
+        const r = await OCR.recognizeVatInvoice(buf, mime, b.fileName);
+        extra = r && r.ok ? { ocr: r } : { ocr_error: (r && (r.msg || r.code)) || '发票识别失败' };
+      } catch (e) {
+        extra = { ocr_error: e.message || String(e) };
+      }
+    }
+    ok(res, saved, extra);
   });
 
   router.get('/api/system/attachments', async (req, res) => {

@@ -697,6 +697,99 @@
   };
 
   /* ============ 发票管理 ============ */
+
+  /**
+   * 用 OCR 结果回填发票表单（新增发票时上传票面 PDF/图片的自动识别结果）。
+   *
+   * @param {HTMLElement} mask 表单根节点
+   * @param {object} o          后端 /api/system/upload 顶层返回的 ocr 对象
+   * @param {boolean} isEdit    true=编辑既有发票：只填空字段，绝不覆盖已录入的值
+   *
+   * 【为什么编辑态要区别对待】
+   *   「编辑」时表单里本来就是这条发票的真实数据，上传一张附件就把发票号码/
+   *   金额冲掉属于数据破坏；而「新增」时核心字段是空的（开票日期除外，它有
+   *   「今天」的默认值，正好该被票面日期覆盖），让识别结果填进去才是目的。
+   */
+  function FillInvoiceOcr(mask, o, isEdit) {
+    const setVal = (key, val) => {
+      if (val === '' || val === null || val === undefined) return false;
+      const el = mask.querySelector('[data-f="' + key + '"]');
+      if (!el) return false;
+      if (isEdit && String(el.value || '').trim() !== '') return false;   // 编辑态：不覆盖
+      el.value = val;
+      // 触发 input/change：税率变了要让人看到（后续税额由后端在保存时按此重算）
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    };
+    const filled = [];
+    // 【核心字段】价税合计(小写) → 开票金额
+    // 本项目 amount 是**含税**口径（beforeInsert 里税额 = amount - amount/(1+税率)），
+    // 正好与票面的「价税合计」对应，不是「合计金额（不含税）」。
+    if (setVal('invoiceNo', o.invoice_no)) filled.push('发票号码');
+    if (setVal('invoiceDate', o.date)) filled.push('开票日期');
+    if (setVal('amount', o.tax_included)) filled.push('开票金额（价税合计 ' + U.money(o.tax_included) + ' 元）');
+    if (setVal('taxRate', o.tax_rate)) filled.push('税率 ' + o.tax_rate + '%');
+    // 【辅助字段】本系统记录的是开给客户的销项发票 ⇒ 票面「购买方」= 开票客户，
+    // 对应表单的「发票抬头」；「销售方」（本公司）不填。
+    if (setVal('title', o.buyer)) filled.push('发票抬头');
+    if (setVal('taxNo', o.buyer_tax_no)) filled.push('纳税人识别号');
+    if (setVal('bankInfo', o.buyer_bank)) filled.push('开户行及账号');
+    if (setVal('address', o.buyer_addr)) filled.push('地址电话');
+
+    if (filled.length) {
+      UI.toast('已自动识别并填入：' + filled.join('、') + '，请核对后保存', 'ok');
+      return;
+    }
+    const gotSomething = !!(o.invoice_no || o.date || o.tax_included !== '');
+    if (gotSomething && isEdit) UI.toast('已识别到票面信息，但表单对应字段已有内容，未做覆盖', '');
+    else UI.toast('识别完成，但未取到可回填的字段，请手工填写', 'err');
+  }
+
+  /**
+   * 发票表单「上传票面」按钮：上传 → 取识别结果 → 回填。
+   *
+   * 与 components.js 里通用的附件上传是**同一套 base64 JSON 契约**
+   * （不能改 FormData —— lib/http.js 对 multipart 只返回 { _raw }，
+   *  详见 .workbuddy/memory/MEMORY.md 的「导入/上传功能的唯一正确姿势」），
+   * 只多两件事：bizType 固定 'invoice'（后端据此触发发票 OCR），
+   * 以及上传完读响应**顶层**的 ocr / ocr_error 回填表单。
+   */
+  function InvoiceOcrPick(mask, isEdit) {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.pdf,image/*';
+    inp.multiple = true;
+    inp.onchange = async () => {
+      const files = Array.from(inp.files || []);
+      if (!files.length) return;
+      const store = mask.querySelector('[data-f="attachments"]');
+      if (!store) return;
+      let arr = []; try { arr = JSON.parse(store.value || '[]'); } catch (e) { arr = []; }
+      const btn = mask.querySelector('[data-pick-files="attachments"]');
+      const label = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '识别中…（PDF / 大图约需数秒）'; }
+      try {
+        for (const f of files) {
+          const dataUrl = await new Promise(res => {
+            const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(f);
+          });
+          const r = await POST('/api/system/upload', { fileName: f.name, dataBase64: dataUrl, bizType: 'invoice' });
+          if (!r.ok) { UI.toast('附件上传失败：' + (r.msg || ''), 'err'); continue; }
+          if (r.data) { arr.push(r.data); store.value = JSON.stringify(arr); Form.renderFiles(mask, 'attachments'); }
+          if (r.ocr) FillInvoiceOcr(mask, r.ocr, isEdit);
+          else if (r.ocr_error) UI.toast('发票识别未完成：' + r.ocr_error + '（附件已保存，可手工填写）', 'err');
+          // 两个都没有：后端未启用识别（旧版本），静默即可，不影响附件
+        }
+      } catch (e) {
+        UI.toast('上传异常：' + (e && e.message ? e.message : e), 'err');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = label || '上传票面 PDF / 图片（自动识别）'; }
+      }
+    };
+    inp.click();
+  }
+
   App.view('invoice', {
     title: '发票管理',
     async render(el) {
@@ -704,6 +797,8 @@
       const sum = await GET('/api/invoice/summary');
       const v = CrudView({
         title: '发票管理', name: '发票', api: '/api/invoice/invoices', size: 20, formWidth: 'wide',
+        // bizType 决定附件的归类和「上传后是否触发发票 OCR」（后端认 'invoice'）
+        bizType: 'invoice',
         exportUrl: '/api/report/export/invoices',
         filters: [
           { key: 'projectId', label: '项目', type: 'select', options: projects.map(p => ({ value: p.id, text: p.name })) },
@@ -722,6 +817,16 @@
           { title: '金额', key: 'amount', width: 100, num: true },
           { title: '税率', key: 'taxRate', width: 60, render: r => (r.taxRate || 0) + '%' },
           { title: '税额', key: 'taxAmount', width: 90, num: true },
+          {
+            title: '票面', key: 'attachments', width: 60,
+            render: r => {
+              const a = (r.attachments || [])[0];
+              if (!a) return '<span class="muted">—</span>';
+              return '<a class="link" href="' + U.esc(a.url) + '" target="_blank" title="' +
+                U.esc((r.attachments || []).map(x => x.name).join('、')) + '">📎' +
+                ((r.attachments || []).length > 1 ? (r.attachments || []).length : '') + '</a>';
+            }
+          },
           { title: '模板', key: 'template', width: 70 },
           { title: '状态', key: 'status', width: 80, render: r => U.statusTag(r.status) },
           { title: '开票人', key: 'by', width: 80 }
@@ -755,8 +860,19 @@
           { key: 'taxNo', label: '纳税人识别号' },
           { key: 'bankInfo', label: '开户行及账号' },
           { key: 'address', label: '地址电话' },
+          {
+            key: 'attachments', label: '票面附件（PDF / 图片）', type: 'files', span: 'full',
+            hint: '上传发票 PDF 或票面照片后，系统会自动识别「发票号码 / 开票日期 / 价税合计 / 税率」并填入上方字段，请核对无误后再保存。未配置识别凭据或识别失败时，附件照常保存，手工填写即可。'
+          },
           { key: 'remark', label: '备注', span: 'full', type: 'textarea' }
         ],
+        // 覆盖通用的「上传附件」按钮：发票附件需要在上传后拿识别结果回填表单
+        onFormMount(mask, values) {
+          const btn = mask.querySelector('[data-pick-files="attachments"]');
+          if (!btn) return;
+          btn.textContent = '上传票面 PDF / 图片（自动识别）';
+          btn.onclick = () => InvoiceOcrPick(mask, !!values.id);
+        },
         optionSources: {
           customers: async () => (await Cache.customers()).map(c => ({ value: c.id, text: c.name }))
         }

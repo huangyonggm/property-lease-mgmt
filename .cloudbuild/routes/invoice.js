@@ -46,6 +46,10 @@ module.exports = function (db, router) {
       b.code = b.code || db.nextNo('invoices', 'FP', today());
       b.by = (req.u || {}).name || ''; b.byId = req.user.id;
       b.status = b.status || '已开具';
+      // 票面 PDF/图片附件（JSON 列，云端以文本存、读时自动还原成数组）。
+      // 新增时表单若没走附件控件（如「按账单拆分开票」生成的票），兜底成空数组，
+      // 避免列表页 render 里 (r.attachments || []) 之外的地方读到 undefined。
+      b.attachments = b.attachments || [];
       b.taxRate = num(b.taxRate, 9);
       b.taxAmount = money(num(b.amount) - num(b.amount) / (1 + b.taxRate / 100));
       if (b.billIds) {
