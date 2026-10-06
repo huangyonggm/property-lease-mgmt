@@ -14,7 +14,82 @@ const { num, pad, fmtDate, addDays } = require('./util');
 // （原 Python 小工具的界面上就有「起始 / ~ 次日」两个输入框，此处保持同等能力）。
 // 覆盖方式见 resolveWindow()。
 const NIGHT_START_MIN = 18 * 60 + 30;   // 18:30
-const NIGHT_END_MIN = 6 * 60 + 30;      // 次日 06:30
+const NIGHT_END_MIN = 8 * 60 + 30;       // 次日 08:30（对齐巡更小工具口径，原为 06:30）
+
+/* ==================== 夜班 5 时段划分（夜班专项口径） ====================
+ *
+ * 【为什么必须分时段】巡更考核的���义是「每晚每一轮都要巡满全部点位」。
+ * 早期实现只把整个夜班的打卡并成一个集合去重（checked[code]=true 一次算过），
+ * 分母也只按 点数 × 夜数 计算，等于把 5 轮巡更当 1 轮算——
+ * 实测 3 月数据：这样算出来是 96.5%，而按 5 时段算是 60.5%。
+ * 差距来自「后半夜基本没人巡」被整体抹平了：6 点半到 8 点半实际只完成 4.2%，
+ * 1 点到 3 点有 9 个整夜零打卡，但整夜去重后这些夜看起来仍是「都巡过了」。
+ *
+ * 所以：分母 = 点数 × 时段数 × 夜数，且**每个时段独立去重**。
+ * 口径原文：「同一**时段**同一巡检点打 2 次、3 次只记为 1 次有效」
+ *   → 去重范围是「时段内」，绝不是「整夜内」。
+ *
+ * 时间边界精确到分钟区间（HH:MM 闭区间，含首含尾）：
+ *   18点半到21点18:30:00-20:59:59
+ *   21点到1点     21:00:00-00:59:59（跨零点）
+ *   1点到3点      01:00:00-02:59:59（归属前一日夜班）
+ *   3点到6点半    03:00:00-06:29:59（归属前一日夜班）
+ *   6点半到8点半  06:30:00-08:29:59（归属前一日夜班）
+ */
+const NIGHT_SEGMENTS = [
+  { name: '18点半到21点', ranges: [['18:30', '20:59', false]] },
+  { name: '21点到1点', ranges: [['21:00', '23:59', false], ['00:00', '00:59', true]] },
+  { name: '1点到3点', ranges: [['01:00', '02:59', true]] },
+  { name: '3点到6点半', ranges: [['03:00', '06:29', true]] },
+  { name: '6点半到8点半', ranges: [['06:30', '08:29', true]] }
+];
+
+/** 'HH:MM' → 分钟数 */
+function hm2min(hm) {
+  const m = /^(\d{1,2})\s*[:：]\s*(\d{1,2})$/.exec(String(hm || '').trim());
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+/** 把 NIGHT_SEGMENTS 预编译成「分钟数 + 是否归属前一日」的扁平表 */
+const SEGMENT_FLAT = [];
+NIGHT_SEGMENTS.forEach(seg => {
+  seg.ranges.forEach(r => {
+    const lo = hm2min(r[0]), hi = hm2min(r[1]);
+    if (lo === null || hi === null) return;
+    SEGMENT_FLAT.push({ seg: seg.name, lo: lo, hi: hi, cross: !!r[2] });
+  });
+});
+const SEGMENT_NAMES = NIGHT_SEGMENTS.map(s => s.name);
+
+/**
+ * 把打卡时间归属到「夜班时段」。
+ * @param {Date|number} dt
+ * @returns {{seg:string, shiftDate:string}|null}  落在夜班窗口外返回 null（白天 08:30-18:29）
+ */
+function assignSegment(dt) {
+  const d = dt instanceof Date ? dt : new Date(dt);
+  if (isNaN(d.getTime())) return null;
+  const mins = d.getHours() * 60 + d.getMinutes();
+  for (let i = 0; i < SEGMENT_FLAT.length; i++) {
+    const s = SEGMENT_FLAT[i];
+    if (mins >= s.lo && mins <= s.hi) {
+      return { seg: s.seg, shiftDate: s.cross ? addDays(fmtDate(d), -1) : fmtDate(d) };
+    }
+  }
+  return null;
+}
+
+/** 时段定义的展示文本，如「18点半到21点=18:30:00-20:59:59」 */
+function segmentDescriptions() {
+  return NIGHT_SEGMENTS.map(seg => seg.name + '=' + seg.ranges
+    .map(r => {
+      const p = (n) => String(n).padStart(2, '0');
+      const lo = hm2min(r[0]), hi = hm2min(r[1]);
+      return p(Math.floor(lo / 60)) + ':' + p(lo % 60) + ':00-' +
+        p(Math.floor(hi / 60)) + ':' + p(hi % 60) + ':59';
+    }).join('、')).join('；');
+}
 
 /** 默认窗口对象（18:30 ~ 次日 06:30），字段齐全，供 resolveWindow 兜底 */
 function defaultWindow() {
@@ -630,8 +705,15 @@ function normPointName(s) {
  * @param {object} shift      {shiftDate, records}
  * @param {Array}  points     标准巡检点（地点卡）
  * @param {Array<string>} nightPersons 夜班人员名单（为空则不限）
+ * @param {object} [opt]
+ *   bySegment=true 时启用「夜班 5 时段」口径（默认）：
+ *     · 每晚每时段各自独立判定应巡/实巡
+ *     · 同一时段同一巡点打 2/3 次只记 1 次；跨时段打卡**各时段各算一次**
+ *     · 分母 = 点数 × 5；漏巡明细带时段维度
+ *   bySegment=false 时退回旧的整夜去重口径（仅供对比对照，默认不用）
  */
-function dailyReport(shift, points, nightPersons) {
+function dailyReport(shift, points, nightPersons, opt) {
+  const bySegment = !(opt && opt.bySegment === false);
   const codes = points.map(p => p.code);
   const codeSet = {};
   codes.forEach(c => { codeSet[c] = true; });
@@ -641,7 +723,9 @@ function dailyReport(shift, points, nightPersons) {
     const k = normPointName(p.name);
     if (k && nameToCode[k] === undefined) nameToCode[k] = p.code;
   });
-  const checked = {};
+
+  // 时段桶：segName -> { checked:{}, persons:{} }；未启用时段时只有一个 '__night__' 桶
+  const buckets = {};
   const personSet = {};
   const np = nightPersons && nightPersons.length ? nightPersons.slice() : null;
   let byNameHit = 0;
@@ -655,29 +739,90 @@ function dailyReport(shift, points, nightPersons) {
       const byName = nameToCode[normPointName(r.pointName)];
       if (byName) { hitCode = byName; byNameHit++; }
     }
-    if (hitCode) checked[hitCode] = true;
+    const asg = bySegment ? assignSegment(r.timeAt) : null;
+    const segName = bySegment
+      ? (asg ? asg.seg : '__out__')          // __out__ = 夜班窗口外（白天 08:30-18:29），不计入
+      : '__night__';
+    if (bySegment && !asg) return;          // 时段外记录整条不参与统计
+
+    const b = buckets[segName] || (buckets[segName] = { checked: {}, persons: {} });
+    // 【关键】只在本时段内去重：同一时段同一巡点打 2 次只记 1 次。
+    // 不跨时段去重 —— 否则 5 轮巡更被当成 1 轮，完成率虚高到 96.5%（历史 bug）。
+    if (hitCode) b.checked[hitCode] = true;
+    if (r.person) b.persons[r.person] = true;
+
     if (np) { if (np.indexOf(r.person) >= 0) personSet[r.person] = true; }
     else if (r.person) personSet[r.person] = true;
   });
 
-  const missed = codes.filter(c => !checked[c]);
   const persons = Object.keys(personSet).sort();
   // 当晚实际出现过的全部人员（含未登记在人员卡里的）
   const allMap = {};
   shift.records.forEach(r => { if (r.person) allMap[r.person] = true; });
   const allPersons = Object.keys(allMap).sort();
-  const totalExpected = codes.length;
-  const totalActual = Object.keys(checked).length;
+
   const times = shift.records.map(r => r.timeAt).sort((a, b) => a - b);
+  const nameOf = {};
+  points.forEach(p => { nameOf[p.code] = p.name || p.code; });
+
+  /* ---------- 分时段明细（每段独立应巡/实巡/漏巡） ---------- */
+  const segNames = bySegment ? SEGMENT_NAMES : ['__night__'];
+  const rounds = segNames.map(segName => {
+    const b = buckets[segName] || { checked: {}, persons: {} };
+    const coveredCodes = Object.keys(b.checked);
+    const missing = codes.filter(c => !b.checked[c]);
+    const ps = Object.keys(b.persons).sort();
+    return {
+      round: segName,
+      should: codes.length,
+      covered: coveredCodes.length,
+      rate: codes.length ? Math.round(coveredCodes.length / codes.length * 10000) / 100 : 0,
+      missingCodes: missing,
+      missingPoints: missing.map(c => nameOf[c] || c),
+      persons: ps,
+      personText: ps.join('、') || '整时段无记录'
+    };
+  });
+
+  // 应巡/实巡汇总：分母 = 点数 × 时段数（不是只 ×1）
+  const totalExpected = bySegment ? codes.length * rounds.length : codes.length;
+  let totalActual = 0;
+  if (bySegment) {
+    rounds.forEach(x => { totalActual += x.covered; });
+  } else {
+    const b = buckets['__night__'] || { checked: {} };
+    totalActual = Object.keys(b.checked).length;
+  }
+
+  // missed 汇总（按点去重，仅用于「本夜该点一次都没巡到」这类天级查询；
+  // 时段级漏巡请用 rounds[].missingPoints）
+  const missedSet = {};
+  if (bySegment) {
+    rounds.forEach(x => { x.missingCodes.forEach(c => { missedSet[c] = true; }); });
+  } else {
+    const b = buckets['__night__'] || { checked: {} };
+    codes.forEach(c => { if (!b.checked[c]) missedSet[c] = true; });
+  }
+  const missed = Object.keys(missedSet);
+
+  const completeRounds = rounds.filter(x => x.covered > 0 && x.covered === x.should).length;
+  const activeRounds = rounds.filter(x => x.covered > 0).length;
+
   return {
     shiftDate: shift.shiftDate,
     persons: persons,
     personText: persons.join('、'),
     allPersons: allPersons,
     allPersonText: allPersons.join('、'),
-    checked: Object.keys(checked),
+    // checked：非时段口径下= 该夜巡到的点；时段口径下= 各时段巡到的点并集
+    // （仅供展示/兼容旧字段，统计请用 totalActual 与 rounds[].covered）
+    checked: (function () {
+      const s = {};
+      rounds.forEach(x => { x.missingCodes.forEach(c => { s[c] = true; }); });
+      return codes.filter(c => !s[c]);
+    })(),
     missed: missed,
-    missedPoints: missed.map(c => (points.filter(p => p.code === c)[0] || {}).name || c),
+    missedPoints: missed.map(c => nameOf[c] || c),
     totalExpected: totalExpected,
     totalActual: totalActual,
     totalMissed: totalExpected - totalActual,
@@ -686,6 +831,11 @@ function dailyReport(shift, points, nightPersons) {
     // 占比高说明点位卡号与记录卡号不是同一套，需要核查是否中途换过设备/重新发卡。
     matchedByName: byNameHit,
     coverageRate: totalExpected ? Math.round(totalActual / totalExpected * 10000) / 100 : 0,
+    // 时段口径附加字段
+    bySegment: bySegment,
+    rounds: rounds,
+    completeRounds: completeRounds,
+    activeRounds: activeRounds,
     firstTime: times.length ? fmtDateTime(new Date(times[0])) : '',
     lastTime: times.length ? fmtDateTime(new Date(times[times.length - 1])) : '',
     records: shift.records
@@ -698,19 +848,67 @@ function monthlySummary(reports) {
   const totalExpected = reports.reduce((a, r) => a + r.totalExpected, 0);
   const totalActual = reports.reduce((a, r) => a + r.totalActual, 0);
   const totalMissed = totalExpected - totalActual;
+  // 巡满天数：时段口径下= 该夜所有时段都巡满；非时段口径下= 一次都没漏
   const perfect = reports.filter(r => r.totalMissed === 0).length;
 
-  // TOP 漏检点
-  const missCount = {};
+  // 巡满天数/有打卡时段数（时段口径的额外指标）
+  let totalCompleteRounds = 0, totalActiveRounds = 0, totalRounds = 0;
   reports.forEach(r => {
-    r.missed.forEach((c, i) => {
-      const nm = r.missedPoints[i] || c;
-      if (!missCount[c]) missCount[c] = { code: c, name: nm, count: 0 };
-      missCount[c].count++;
+    if (!r.bySegment) return;
+    totalCompleteRounds += r.completeRounds || 0;
+    totalActiveRounds += r.activeRounds || 0;
+    totalRounds += (r.rounds || []).length;
+  });
+
+  // 各时段完成率（时段口径）
+  const segStat = {};
+  if (SEGMENT_NAMES.length) SEGMENT_NAMES.forEach(n => { segStat[n] = { segment: n, expected: 0, covered: 0, zeroNights: 0, nights: 0 }; });
+  reports.forEach(r => {
+    (r.rounds || []).forEach(x => {
+      const s = segStat[x.round];
+      if (!s) return;
+      s.expected += x.should; s.covered += x.covered; s.nights++;
+      if (!x.covered) s.zeroNights++;
     });
   });
-  const topMissed = Object.keys(missCount).map(k => missCount[k])
-    .sort((a, b) => (b.count - a.count) || (a.name < b.name ? -1 : 1));
+  const segments = Object.keys(segStat).map(k => {
+    const s = segStat[k];
+    s.missed = s.expected - s.covered;
+    s.rate = s.expected ? Math.round(s.covered / s.expected * 10000) / 100 : 0;
+    return s;
+  });
+
+  // TOP 漏检点
+  // 【时段口径】按「点次」计：某点该夜漏 5 个时段就记 5 次，
+  // 这样 TOP 排名反映真实漏巡量；跨夜累计则能看出哪几个点整月没巡过。
+  const missCount = {};
+  const missNights = {};
+  reports.forEach(r => {
+    (r.rounds || []).forEach(x => {
+      x.missingPoints.forEach((nm, i) => {
+        const c = x.missingCodes[i] || nm;
+        if (!missCount[nm]) missCount[nm] = { code: c, name: nm, count: 0, nights: {} };
+        missCount[nm].count++;
+        missCount[nm].nights[r.shiftDate] = 1;
+      });
+    });
+    // 兼容非时段口径（rounds 为空时退回 missedPoints）
+    if (!r.bySegment) {
+      (r.missedPoints || []).forEach((nm, i) => {
+        const c = (r.missed || [])[i] || nm;
+        if (!missCount[nm]) missCount[nm] = { code: c, name: nm, count: 0, nights: {} };
+        missCount[nm].count++;
+        missCount[nm].nights[r.shiftDate] = 1;
+      });
+    }
+  });
+  const topMissed = Object.keys(missCount).map(k => {
+    const o = missCount[k];
+    o.nightCount = Object.keys(o.nights).length;
+    o.neverChecked = o.nightCount >= totalNights;   // 整夜一整月都没巡到
+    delete o.nights;
+    return o;
+  }).sort((a, b) => (b.count - a.count) || (a.name < b.name ? -1 : 1));
 
   // 人员统计（按当晚实际出现的全部人员）
   const stats = {};
@@ -744,6 +942,11 @@ function monthlySummary(reports) {
     perfectNights: perfect,
     coverageRate: totalExpected ? Math.round(totalActual / totalExpected * 10000) / 100 : 0,
     perfectRate: totalNights ? Math.round(perfect / totalNights * 10000) / 100 : 0,
+    // ��段口径附加
+    totalRounds: totalRounds,
+    totalCompleteRounds: totalCompleteRounds,
+    totalActiveRounds: totalActiveRounds,
+    segments: segments,
     topMissed: topMissed,
     personStats: personStats
   };
@@ -758,7 +961,11 @@ function monthlySummary(reports) {
  *   mode         'night' 夜班（默认）| 'day' 白班
  *   nightPersons 夜班人员名单（可选，为空则不限人员）
  *   window       夜班时段（可选）：'18:30' 字符串，或 { startMin, endMin } / { startH,startM,endH,endM }
- *                不传则用默认 18:30 ~ 次日 06:30（与原 Python 小工具默认值一致）
+ *                不传则用默认 18:30 ~ 次日 08:30
+ *   bySegment    夜班 5 时段口径（默认 true）；传false 退回整夜去重（仅用于对照）
+ *   strictWindow true 时排除「窗口不完整」的夜班（数据首日的前一夜、末日的后一夜），
+ *                口径原文：「仅纳入窗口完整落在数据范围内的夜班」。
+ *                默认 true —— 避免最后一天夜班只有半段记录被算成大面积漏巡。
  * @returns {{daily:Array, monthly:object, mode:string, window:object, windowText:string}}
  */
 function analyze(p) {
@@ -767,15 +974,55 @@ function analyze(p) {
   const records = opt.records || [];
   const mode = opt.mode === 'day' ? 'day' : 'night';
   const w = resolveWindow(opt.window);
-  const shifts = mode === 'day'
+  const bySegment = opt.bySegment !== false;
+  // 白班是自然日归组，不适用夜班时段口径
+  const useSeg = (mode === 'night') && bySegment;
+  const strict = opt.strictWindow !== false;
+
+  let shifts = mode === 'day'
     ? buildDayShifts(records, opt.start, opt.end, w)
     : buildNightShifts(records, opt.start, opt.end, w);
+
+  // 【窗口完整性】夜班窗口 = 班次日 18:30 ~ 次日 08:29:59。
+  // 若这个窗口超出了实际数据的时间范围（数据首日之前 / 数据末日之后），
+  // 该夜班就只有一个半段记录，纳进统计会凭空产生几十个假漏检 —— 必须排除。
+  let dataMin = null, dataMax = null, excludedNights = [];
+  if (useSeg && strict && records.length) {
+    records.forEach(r => {
+      const t = r.timeAt;
+      if (typeof t !== 'number' || isNaN(t)) return;
+      if (dataMin === null || t < dataMin) dataMin = t;
+      if (dataMax === null || t > dataMax) dataMax = t;
+    });
+    if (dataMin !== null) {
+      shifts = shifts.filter(sh => {
+        // 夜班窗口 = 班次日 18:30 ~ **次日** 08:29:59
+        // （结束时间在次日，跨天；这里最容易漏加一天，导致末日那夜被误判为「完整」）
+        const winStart = new Date(sh.shiftDate + 'T18:30:00').getTime();
+        const winEnd = new Date(sh.shiftDate + 'T00:00:00').getTime()
+          + 24 * 3600000          // 次日
+          + (8 * 60 + 30) * 60000 // 08:30
+          - 1000;                 // 08:29:59
+        const okStart = winStart >= dataMin;
+        const okEnd = winEnd <= dataMax;
+        if (!okStart || !okEnd) { excludedNights.push(sh.shiftDate); return false; }
+        return true;
+      });
+    }
+  }
+
   const crew = mode === 'day' ? opt.dayPersons : opt.nightPersons;
-  const daily = shifts.map(s => dailyReport(s, points, crew));
+  const daily = shifts.map(s => dailyReport(s, points, crew, { bySegment: useSeg }));
   const monthly = monthlySummary(daily);
   return {
     daily: daily, monthly: monthly, mode: mode,
-    window: w, windowText: windowText(w)
+    window: w, windowText: windowText(w),
+    bySegment: useSeg,
+    segments: useSeg ? SEGMENT_NAMES : [],
+    segmentText: useSeg ? segmentDescriptions() : '',
+    excludedNights: excludedNights,
+    dataStart: dataMin !== null ? fmtDate(new Date(dataMin)) : '',
+    dataEnd: dataMax !== null ? fmtDate(new Date(dataMax)) : ''
   };
 }
 
@@ -796,6 +1043,8 @@ function nightPersonNames(persons, records) { return personNamesOf(persons, reco
 
 module.exports = {
   NIGHT_START_MIN, NIGHT_END_MIN,
+  NIGHT_SEGMENTS, SEGMENT_NAMES,
+  assignSegment, segmentDescriptions, hm2min,
   resolveWindow, windowText, defaultWindowText: windowText(defaultWindow()),
   parseTime, fmtDateTime, pointSortKey,
   parsePoints, parseRecords, matchHeader, inferRecordColumns, REC_ALIASES,

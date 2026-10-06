@@ -198,22 +198,27 @@
           const f = fileIn.files[0];
           if (!f) return;
           btn.disabled = true; btn.textContent = '上传中…'; result.innerHTML = '';
-          const fd = new FormData(); fd.append('file', f);
-          try {
-            const r = await fetch('/api/hr/import/employees', { method: 'POST', body: fd, credentials: 'same-origin' });
-            const j = await r.json();
-            if (j.ok) {
-              result.innerHTML = '<div class="tag green">✓ 导入完成：' + j.imported + ' 条记录（新增 ' + j.imported + ' / 跳过重复 ' + (j.total - j.imported - (j.skipped || 0)) + '）</div>' +
-                (j.errors && j.errors.length ? '<div class="muted mt8">失败 ' + j.errors.length + ' 行：</div><ul class="muted">' + j.errors.map(e => '<li>第' + e.row + '行：' + e.err + '</li>').join('') + '</ul>' : '');
-              if (j.ok) refresh();
-            } else {
-              result.innerHTML = '<div class="tag red">✗ ' + U.esc(j.msg || '导入失败') + '</div>';
+          // base64 JSON 上传（不要用 FormData：服务端 readBody 对 multipart 只回
+          // { _raw: Buffer }，拿不到文件字节 → 会报「文件为空」。详见 lib/http.js）
+          const fr = new FileReader();
+          fr.onload = async () => {
+            try {
+              const j = await POST('/api/hr/import/employees', { fileName: f.name, fileBase64: fr.result });
+              if (j.ok) {
+                const d = j.data || j;
+                result.innerHTML = '<div class="tag green">✓ 导入完成：' + d.imported + ' 条记录（新增 ' + d.imported + ' / 跳过重复 ' + (d.total - d.imported - (d.skipped || 0)) + '）</div>' +
+                  (d.errors && d.errors.length ? '<div class="muted mt8">失败 ' + d.errors.length + ' 行：</div><ul class="muted">' + d.errors.map(e => '<li>第' + e.row + '行：' + e.err + '</li>').join('') + '</ul>' : '');
+                refresh();
+              } else {
+                result.innerHTML = '<div class="tag red">✗ ' + U.esc(j.msg || '导入失败') + '</div>';
+              }
+            } catch (e) {
+              result.innerHTML = '<div class="tag red">✗ 网络错误：' + U.esc(e.message) + '</div>';
+            } finally {
+              btn.disabled = false; btn.textContent = '选择文件并上传';
             }
-          } catch (e) {
-            result.innerHTML = '<div class="tag red">✗ 网络错误：' + U.esc(e.message) + '</div>';
-          } finally {
-            btn.disabled = false; btn.textContent = '选择文件并上传';
-          }
+          };
+          fr.readAsDataURL(f);
         };
       }
     });

@@ -149,19 +149,27 @@ module.exports = function (db, router) {
     res.end(buf);
   });
 
-  /** 批量导入客户档案 */
+  /**
+   * 批量导入客户档案
+   *
+   * 【为什么用 base64 JSON 而不是 FormData 上传】
+   * 服务端 lib/http.js 的 readBody 对 multipart/form-data 只返回 { _raw: Buffer }，
+   * 而这里要的是文件字节；写成 `Array.isArray(req.body)` 会**恒为 false**，
+   * 表现就是「文件为空」—— 前端明明选了文件也传不进来。
+   * 本项目已验证可用的方式是「FileReader 读成 dataURL → JSON 传 fileBase64」，
+   * 与 /api/income/import/recharge 保持一致，本地与 Netlify 两种运行时都走同一套。
+   */
   router.post('/api/customer/import/customers', async (req, res) => {
     if (!can(req, res, 'customer:manage')) return fail(res, '无权限');
-    const body = req.body;
-    if (!Array.isArray(body) || body.length === 0) return fail(res, '文件为空');
+    const b = req.body || {};
+    if (!b.fileBase64) return fail(res, '缺少文件');
 
     const XLSX = require('../node_modules/xlsx');
-    const { Buffer } = require('buffer');
 
     // 读取 buffer → xlsx sheet → rows
     let rows;
     try {
-      const ab = Buffer.from(body);
+      const ab = Buffer.from(String(b.fileBase64).split(',').pop(), 'base64');
       const wb = XLSX.read(ab, { type: 'array' });
       rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
     } catch (e) {
@@ -216,7 +224,10 @@ module.exports = function (db, router) {
       }
     }
 
-    res.json({ ok: true, total: rows.length, imported: ok_count, errors: failList });
+    // 用 ok() 而不是 res.json()：本地 server.js 用的是原生 http ServerResponse，
+    // Netlify 用的是 MiniRes，两者都**没有** res.json() → 直接抛
+    // 「res.json is not a function」，前端只能看到「服务端异常」。
+    ok(res, { total: rows.length, imported: ok_count, errors: failList });
   });
 
   return router;

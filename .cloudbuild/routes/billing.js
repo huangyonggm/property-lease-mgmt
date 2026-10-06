@@ -420,13 +420,16 @@ module.exports = function (db, router) {
   /** 批量导入电表抄表记录 */
   router.post('/api/finance/meters/import/electric', async (req, res) => {
     if (!can(req, res, 'billing:meter')) return fail(res, '无权限');
-    const body = req.body;
-    if (!Array.isArray(body) || body.length === 0) return fail(res, '文件为空');
+    // 【为什么用 base64 JSON 而不是 FormData 上传】见 routes/customer.js 同名注释：
+    // lib/http.js 的 readBody 对 multipart 只回 { _raw: Buffer }，
+    // `Array.isArray(req.body)` 恒为 false → 前端会看到「文件为空」。
+    const b = req.body || {};
+    if (!b.fileBase64) return fail(res, '缺少文件');
 
     const XLSX = require('../node_modules/xlsx');
     let rows;
     try {
-      const ab = Buffer.from(body);
+      const ab = Buffer.from(String(b.fileBase64).split(',').pop(), 'base64');
       const wb = XLSX.read(ab, { type: 'array' });
       rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
     } catch (e) {
@@ -438,7 +441,9 @@ module.exports = function (db, router) {
     const meterMap = {};
     meters.forEach(m => { if (m.type === '电表') meterMap[m.meterNo] = m; });
 
-    let ok = 0, failList = [];
+    // ⚠ 计数器不能叫 ok：会遮蔽模块顶部从 lib/http 导入的 ok() 函数，
+    //   导致末尾 ok(res, …) 抛「ok is not a function」。
+    let okCount = 0, failList = [];
     for (const raw of rows) {
       const meterNo = String(raw['表号'] || raw['meterNo'] || '').trim();
       const date = String(raw['抄表日期'] || raw['date'] || '').trim();
@@ -461,21 +466,24 @@ module.exports = function (db, router) {
           date, value: num(value), by: (req.u || {}).name || '', source: 'Excel导入'
         });
       }
-      ok++;
+      okCount++;
     }
-    ok(res, { imported: ok, errors: failList });
+    ok(res, { imported: okCount, errors: failList });
   });
 
   /** 批量导入水表抄表记录 */
   router.post('/api/finance/meters/import/water', async (req, res) => {
     if (!can(req, res, 'billing:meter')) return fail(res, '无权限');
-    const body = req.body;
-    if (!Array.isArray(body) || body.length === 0) return fail(res, '文件为空');
+    // 【为什么用 base64 JSON 而不是 FormData 上传】见 routes/customer.js 同名注释：
+    // lib/http.js 的 readBody 对 multipart 只回 { _raw: Buffer }，
+    // `Array.isArray(req.body)` 恒为 false → 前端会看到「文件为空」。
+    const b = req.body || {};
+    if (!b.fileBase64) return fail(res, '缺少文件');
 
     const XLSX = require('../node_modules/xlsx');
     let rows;
     try {
-      const ab = Buffer.from(body);
+      const ab = Buffer.from(String(b.fileBase64).split(',').pop(), 'base64');
       const wb = XLSX.read(ab, { type: 'array' });
       rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
     } catch (e) {
@@ -487,7 +495,9 @@ module.exports = function (db, router) {
     const meterMap = {};
     meters.forEach(m => { if (m.type === '水表') meterMap[m.meterNo] = m; });
 
-    let ok = 0, failList = [];
+    // ⚠ 计数器不能叫 ok：会遮蔽模块顶部从 lib/http 导入的 ok() 函数，
+    //   导致末尾 ok(res, …) 抛「ok is not a function」。
+    let okCount = 0, failList = [];
     for (const raw of rows) {
       const meterNo = String(raw['表号'] || raw['meterNo'] || '').trim();
       const date = String(raw['抄表日期'] || raw['date'] || '').trim();
@@ -510,9 +520,9 @@ module.exports = function (db, router) {
           date, value: num(value), by: (req.u || {}).name || '', source: 'Excel导入'
         });
       }
-      ok++;
+      okCount++;
     }
-    ok(res, { imported: ok, errors: failList });
+    ok(res, { imported: okCount, errors: failList });
   });
 
   return router;

@@ -28,22 +28,45 @@ module.exports = function (db, router, opt) {
   const ctx = opt || {};
   const uploadDir = ctx.uploadDir || path.join(ctx.rootDir || __dirname + '/..', 'uploads');
 
-  /* 遗漏明细表：逐条「班次日 + 漏检点 + 卡号 + 当班人员」
-     对齐原 Python 工具 analysis.get_missed_detail + export_daily_to_excel 的「遗漏汇总」表 */
+  /* 遗漏明细表：逐条「班次日 + 时段 + 漏检点 + 卡号 + 该时段巡检人 + 当班人员」
+     对齐巡更小工具 patrol_core 的「漏巡明细」表。
+     【为什么要时段列】夜班是5 轮（18:30-21:00 / 21:00-01:00 / 01:00-03:00 /
+     03:00-06:30 / 06:30-08:30），每轮都要巡满全部点位才算完成。
+     只记「班次日+点位」会把 5 轮的漏巡压成1 条，看不出是哪一轮没巡 ——
+     这正是旧实现算出 96.5% 虚高率的根源。现在按「时段 × 点位」逐条列出。 */
   const M_MISS_HEADERS = [
     { title: '班次日', key: 'date' },
+    { title: '时段', key: 'segment' },
     { title: '漏检点位', key: 'name' },
     { title: '卡号', key: 'code' },
+    { title: '该时段巡检人', key: 'segPerson' },
     { title: '当班人员', key: 'person' }
   ];
   function missedDetailRows(daily) {
     const rows = [];
     (daily || []).forEach(d => {
+      // 时段口径：逐时段列出漏检点（同一夜可能有多行）
+      if (d.bySegment && (d.rounds || []).length) {
+        (d.rounds || []).forEach(x => {
+          (x.missingPoints || []).forEach((nm, i) => {
+            rows.push({
+              date: d.shiftDate,
+              segment: x.round,
+              name: nm,
+              code: (x.missingCodes || [])[i] || '',
+              segPerson: x.personText || '整时段无记录',
+              person: d.allPersonText || '未知'
+            });
+          });
+        });
+        return;
+      }
+      // 非时段口径（兼容）
       (d.missed || []).forEach((c, i) => {
         rows.push({
-          date: d.shiftDate,
-          name: (d.missedPoints || [])[i] || c,
-          code: c,
+          date: d.shiftDate, segment: '整夜',
+          name: (d.missedPoints || [])[i] || c, code: c,
+          segPerson: d.personText || '整时段无记录',
           person: d.allPersonText || '未知'
         });
       });
@@ -447,24 +470,39 @@ module.exports = function (db, router, opt) {
       x.time, (x.pointCode || x.pointName || ''), x.person || ''
     ].join('');
     const existed = {};
-    db.load('patrolRecords').forEach(x => { existed[dupKey(x)] = true; });
+    // 【双引擎兼容】原来写的是 db.load('patrolRecords')，
+    // 但那只在本地 JSON 引擎（lib/db.js）里有；云端引擎（lib/clouddb.js，DB_MODE=cloud）
+    // 的 37 个方法里**根本没有 load** —— 于是云端一导入就抛
+    //   TypeError: db.load is not a function
+    // 前端 bindImport 的 catch 捕获后弹「导入异常：db.load is not a function」，
+    // 用户看到的就是「网络异常 / 导入异常」，而真正的错误只留在服务端。
+    // where() 两个引擎都支持且语义一致（返回该集合全部行），是唯一正确写法。
+    (await db.where('patrolRecords')).forEach(x => { existed[dupKey(x)] = true; });
     let dupInBatch = 0;
     const fresh = [];
     parsed.records.forEach(x => {
       const k = dupKey(x);
-      if (existed[k]) { dupInBatch++; return; }   // 已入库过 → 跳过
+      // 【这一行不能少】已入库过 → 跳过。
+      // 少了它，同一份文件重复导出会逐条 push 进库：
+      // 实测云端第1 次导 13669 条、第 2 次 dup=0 又导 13669、第 3 次再 13669，
+      // total 一路涨到 41007，而接口每次都回「导入成功 13669 条」——
+      // 实巡点次翻倍、完成率虚高，且 dup 字段永远是 0，用户完全看不出来。
+      if (existed[k]) { dupInBatch++; return; }
       existed[k] = true;                          // 同时拦掉本次文件内部的自我重复
       fresh.push(x);
     });
 
     const rows = fresh.map(x => Object.assign({ id: uid('pr') }, x));
-    // 分块写入，避免一次性占用过多内存
+    // 【写入方式必须用 insertMany，不能用 load()+push()+persist()】
+    //   · 本地引擎：insertMany 内部会落盘，等价于原来的 push
+    //   · 云端引擎：persist() 是**空操作**（"云端每次写库即落"），
+    //     所以原来的 push 全部丢在内存里，最后那次 persist 什么也没做，
+    //     13669 条记录一条都没进 TiDB —— 接口却返回「导入成功」。
+    // insertMany 在云端是真正分批 INSERT（每批 200 条），
+    // 既避开了 TiDB Serverless 单请求体大小限制，又真的落库。
     const CHUNK = 2000;
     for (let i = 0; i < rows.length; i += CHUNK) {
-      const part = rows.slice(i, i + CHUNK);
-      const arr = db.load('patrolRecords');
-      part.forEach(x => arr.push(x));
-      if (i + CHUNK >= rows.length) db.persist('patrolRecords');
+      await db.insertMany('patrolRecords', rows.slice(i, i + CHUNK));
     }
     const all = (await db.where('patrolRecords'));
     const times = all.map(x => String(x.time)).sort();
@@ -614,6 +652,10 @@ module.exports = function (db, router, opt) {
       mode: mode,
       start: b.start || '', end: b.end || '',
       window: r.window, windowText: r.windowText,
+      // 夜班 5 时段口径（bySegment=false 时退回整夜去重，供对照）
+      bySegment: r.bySegment, segments: r.segments, segmentText: r.segmentText,
+      excludedNights: r.excludedNights,
+      dataStart: r.dataStart, dataEnd: r.dataEnd,
       pointCount: points.length,
       recordCount: records.length,
       daily: r.daily.map(d => {
@@ -678,6 +720,8 @@ module.exports = function (db, router, opt) {
     }
     ok(res, {
       month: m, mode: mode, windowText: r.windowText,
+      bySegment: r.bySegment, segments: r.segments, segmentText: r.segmentText,
+      excludedNights: r.excludedNights, dataStart: r.dataStart, dataEnd: r.dataEnd,
       recordCount: records.length, codeHitRate: codeHitRate,
       // 本次分析用的是哪一套点位：scoped=true 表示命中了该月专属点位（pointMonth）
       pointCount: points.length, pointScope: ptSel.scoped ? 'month' : 'common',
@@ -755,10 +799,19 @@ module.exports = function (db, router, opt) {
       month: dataMonth,
       dataMonth: dataMonth,
       windowText: mr ? mr.windowText : P.windowText(P.defaultWindow ? P.defaultWindow() : windowOf(null)),
+      bySegment: mr ? mr.bySegment : false,
+      segments: mr ? mr.segments : [],
+      segmentText: mr ? mr.segmentText : '',
+      excludedNights: mr ? (mr.excludedNights || []) : [],
       monthNights: mr ? mr.monthly.totalNights : 0,
       monthCoverage: mr ? mr.monthly.coverageRate : 0,
       monthMissed: mr ? mr.monthly.totalMissed : 0,
       monthPerfect: mr ? mr.monthly.perfectNights : 0,
+      monthExpected: mr ? mr.monthly.totalExpected : 0,
+      monthActual: mr ? mr.monthly.totalActual : 0,
+      monthSegments: mr ? (mr.monthly.segments || []) : [],
+      totalRounds: mr ? (mr.monthly.totalRounds || 0) : 0,
+      totalCompleteRounds: mr ? (mr.monthly.totalCompleteRounds || 0) : 0,
       topMissed: mr ? mr.monthly.topMissed.slice(0, 5) : [],
       recent: recent,
       monthRecordCount: mRec.length,
@@ -811,41 +864,92 @@ module.exports = function (db, router, opt) {
     });
 
     if (type === 'monthly') {
+      const useSeg = r.bySegment;
       const headers = [
         { title: '班次日', key: 'shiftDate' },
-        { title: '当班人员', key: 'allPersonText' },
-        { title: '应巡点数', key: 'totalExpected', type: 'number' },
-        { title: '实巡点数', key: 'totalActual', type: 'number' },
-        { title: '漏检点数', key: 'totalMissed', type: 'number' },
-        { title: '覆盖率(%)', key: 'coverageRate', type: 'number' },
+        { title: '当班人员', key: 'allPersonText' }
+      ];
+      // 时段口径：每段「实巡/应巡」两列，直观暴露哪一轮没巡满
+      if (useSeg) {
+        (r.segments || []).forEach(s => {
+          headers.push({ title: s.segment + ' 实/应', value: d => {
+            const x = (d.rounds || []).filter(y => y.round === s.segment)[0];
+            return x ? (x.covered + '/' + x.should) : '0/0';
+          } });
+        });
+      }
+      headers.push(
+        { title: '应巡点次', key: 'totalExpected', type: 'number' },
+        { title: '实巡点次', key: 'totalActual', type: 'number' },
+        { title: '漏巡点次', key: 'totalMissed', type: 'number' },
+        { title: '完成率(%)', key: 'coverageRate', type: 'number' },
         { title: '打卡条数', key: 'recordCount', type: 'number' },
         { title: '首次打卡', key: 'firstTime' },
-        { title: '末次打卡', key: 'lastTime' },
-        { title: '漏检点位', value: d => d.missedPoints.join('、') }
-      ];
+        { title: '末次打卡', key: 'lastTime' }
+      );
       const sheets = [{
         name: mode === 'day' ? '白班日报' : '夜班日报',
         headers: headers, rows: r.daily
       }];
-      // 遗漏明细：逐条「日期 + 漏检点 + 卡号 + 当班人员」
-      // （对齐原 Python 工具 analysis.get_missed_detail / export_daily_to_excel 的「遗漏汇总」表）
+
+      // 第二张：各时段完成率汇总（时段口径才有）
+      if (useSeg && (r.monthly.segments || []).length) {
+        sheets.push({
+          name: '时段完成率',
+          headers: [
+            { title: '时段', key: 'segment' },
+            { title: '应巡点次', key: 'expected', type: 'number' },
+            { title: '实巡点次', key: 'covered', type: 'number' },
+            { title: '漏巡点次', key: 'missed', type: 'number' },
+            { title: '完成率(%)', key: 'rate', type: 'number' },
+            { title: '零打卡夜数', key: 'zeroNights', type: 'number' }
+          ],
+          rows: r.monthly.segments
+        });
+      }
+
+      // 第三张：漏巡明细（班次日 × 时段 × 点位）
       sheets.push({
-        name: '遗漏明细',
+        name: '漏巡明细',
         headers: M_MISS_HEADERS, rows: missedDetailRows(r.daily)
       });
-      // 第三张表：人员统计
+
+      // 第四张：人员统计
       sheets.push({
         name: '人员统计',
         headers: [
           { title: '人员', key: 'person' }, { title: '班次', key: 'shift' },
           { title: '当班次数', key: 'nights', type: 'number' },
           { title: '打卡条数', key: 'records', type: 'number' },
-          { title: '覆盖点数', key: 'checked', type: 'number' },
-          { title: '漏检点数', key: 'missed', type: 'number' },
-          { title: '覆盖率(%)', key: 'rate', type: 'number' }
+          { title: '覆盖点次', key: 'checked', type: 'number' },
+          { title: '漏巡点次', key: 'missed', type: 'number' },
+          { title: '完成率(%)', key: 'rate', type: 'number' }
         ],
         rows: r.monthly.personStats
       });
+
+      // 第五张：口径说明（必须随报表走，避免下一个看到数字的人不知道怎么算的）
+      const notes = [
+        ['统计口径', ''],
+        ['数据范围', (r.dataStart ? r.dataStart + ' ~ ' + r.dataEnd : '')],
+        ['夜班窗口', '当日 18:30 ~ 次日 08:30'],
+        ['时段划分', useSeg ? (r.segmentText || P.segmentDescriptions()) : '整夜去重（旧口径，仅供对照）'],
+        ['时段归属', '次日 00:00-08:29 的打卡归属前一日夜班'],
+        ['去重规则', '同一时段同一巡点打 2 次、3 次只记1 次有效（不跨时段去重）'],
+        ['时段外记录', '白天 08:30-18:29 的打卡不计入夜班清查'],
+        ['应巡基数', points.length + ' 个点位 × ' + ((r.monthly.totalRounds / Math.max(1, r.monthly.totalNights)) || 1) + ' 个时段 × ' + r.monthly.totalNights + ' 夜'],
+        ['未纳入夜班', (r.excludedNights || []).length ? (r.excludedNights || []).join('、') : '无'],
+        ['未纳入原因', '窗口（当日18:30~次日08:30）未完整落在数据范围内，纳入会产生假漏巡'],
+        ['漏巡判定', '某夜某时段中，应巡点位没有有效打卡记录'],
+        ['巡满天数', r.monthly.perfectNights + ' / ' + r.monthly.totalNights + ' 夜'],
+        ['时段全巡满天数', r.monthly.totalCompleteRounds + ' / ' + r.monthly.totalRounds + ' 段']
+      ];
+      sheets.push({
+        name: '口径说明',
+        headers: [{ title: '项目', key: 'k' }, { title: '说明', key: 'v' }],
+        rows: notes.map(x => ({ k: x[0], v: x[1] }))
+      });
+
       const name = '巡更' + (mode === 'day' ? '白班' : '夜班') + '月报_' + start + '_' + end + '.' + fmt;
       return sendDownload(res, name,
         fmt === 'xls' ? XE.toXls(sheets) : XE.toCSV(headers, r.daily),

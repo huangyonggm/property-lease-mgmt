@@ -1,5 +1,7 @@
 /* 视图：巡更检查（数据概览 / 巡更点位 / 巡更人员 / 巡查记录 / 班次日报 / 月度汇总）
-   由「巡更检查小工具」整合而来：夜班时段 18:30 ~ 次日 06:30 */
+   由「巡更检查小工具」整合而来。
+   夜班口径：当日 18:30 ~ 次日 08:30，划为 5 个时段（每段独立考核应巡/实巡）
+     18:30-21:00 / 21:00-01:00 / 01:00-03:00 / 03:00-06:30 / 06:30-08:30 */
 (function () {
 
   function zapPerm(code) {
@@ -33,23 +35,31 @@
   function bustDefaults() { _def = null; }
 
   /* ==================== 夜班时段（可配，对齐原独立小工具 ui.py:79-95） ====================
-   * 原小工具工具栏上有「夜班时段 起始 ~ 次日」两个输入框，我方初版把 18:30/06:30 写死在
+   * 原小工具工具栏上有「夜班时段 起始 ~ 次日」两个输入框，我方初版把 18:30/08:30 写死在
    * lib/patrol.js 里，导致物业改班次后统计口径对不上。这里做成前端可改 + localStorage 记住，
    * 所有涉及班次归属的请求（overview / daily / monthly / export / records）统一带上。 */
-  const WIN_KEY = 'patrol.window.v1';
+  /**
+   * 夜班时段在 localStorage 里的存储键。
+   *
+   * 【为什么升到 v2】v1 存的是「次日 06:30」，而巡更考核的口径是**次日 08:30**
+   * （夜班 18:30 → 次日 08:30，划5 个时段，最后一段 06:30-08:30）。
+   * v1 会把 06:30-08:30 这两个小时的打卡判成白班 ——
+   * 3 月数据实测完成率因此显示 59.8%，比正确的 60.51% 低了 0.7 个百分点。
+   *只改默认值不够：老用户浏览器里 v1 的值还在，会继续覆盖新默认值。
+   * 所以直接换 key，旧数据自然失效（读不到就用 08:30）。
+   */
+  const WIN_KEY = 'patrol.window.v2';
   let _win = null;
   function win() {
     if (_win) return _win;
-    let v = { start: '18:30', end: '06:30' };
-    try {
-      const s = JSON.parse(localStorage.getItem(WIN_KEY) || 'null');
-      if (s && s.start && s.end) v = s;
-    } catch (e) { }
-    _win = v;
-    return v;
+    const v = { start: '18:30', end: '08:30' };
+    let s = null;
+    try { s = JSON.parse(localStorage.getItem(WIN_KEY) || 'null'); } catch (e) { }
+    _win = (s && s.start && s.end) ? s : v;
+    return _win;
   }
   function setWin(start, end) {
-    _win = { start: String(start || '18:30'), end: String(end || '06:30') };
+    _win = { start: String(start || '18:30'), end: String(end || '08:30') };
     try { localStorage.setItem(WIN_KEY, JSON.stringify(_win)); } catch (e) { }
     bustDefaults();          // 口径变了，概览里的默认日期要重取
     return _win;
@@ -216,7 +226,38 @@ h += '<div class="card mb12"><div class="card-head">数据导入（支持 .xls /
           '另有 ' + Math.max(0, (d.pointCount || 0) - (d.monthPointCount || 0)) +
           ' 个通用点位<b>不计入</b>本月分母 —— 它们属于另一套卡号体系）</div>'
         : '') +
+      // 【夜班 5 时段口径】分母 = 点位数 × 5 时段 × 夜数，务必让人看得懂这个数怎么来的
+      (d.bySegment
+        ? '<div class="muted mt8" style="font-size:12.5px">夜班按 <b>5 个时段</b>独立考核：' +
+          (d.segments || []).map(s => U.esc(s)) .join(' / ') +
+          '。应巡 <b>' + (d.monthExpected || 0) + '</b> = ' + (d.monthPointCount || d.pointCount || 0) +
+          ' 点 × 5 时段 × ' + d.monthNights + ' 夜；同一时段同一巡点打多次只记 1 次</div>' +
+          ((d.excludedNights || []).length
+            ? '<div class="muted mt8" style="font-size:12.5px;color:var(--warn)">未纳入夜班（窗口不完整）：' +
+              U.esc(d.excludedNights.join('、')) +
+              ' —— 导出数据需覆盖「当月1 日 ~ 次月 1 日」才完整</div>'
+            : '')
+        : '') +
       '</div></div>';
+
+    // 【各时段完成率】夜班 5 时段是本系统最核心的口径，单独用卡片列出来，
+    // 让「哪个时段没人巡」一眼可见 —— 这正是整夜去重口径掩盖掉的问题。
+    if (d.bySegment && (d.monthSegments || []).length) {
+      h += '<div class="card mb12"><div class="card-head">各时段完成率（夜班 5 时段）</div><div class="card-body">' +
+        '<div class="chart-bars">' + d.monthSegments.map(s => {
+          const pct = Math.round(s.covered / Math.max(1, s.expected) * 100);
+          const hh = Math.max(6, Math.round(s.rate * 1.3));
+          const color = pct >= 95 ? 'var(--success)' : (pct >= 60 ? 'var(--warn)' : 'var(--danger)');
+          return '<div class="bar-col"><div class="bar-vl">' + s.covered + '/' + s.expected + '</div>' +
+            '<div class="bar-wrap"><div class="bar" style="height:' + hh + 'px;background:' + color +
+            '" title="零打卡夜 ' + (s.zeroNights || 0) + ' 夜"></div></div>' +
+            '<div class="bar-lb">' + U.esc(s.segment.replace(/点/g, '').replace(/到/, '')) +
+            (s.zeroNights ? ' ⚠' + s.zeroNights : '') + '</div></div>';
+        }).join('') + '</div>' +
+        '<div class="muted mt8" style="font-size:12.5px">时段全巡满 <b>' + (d.totalCompleteRounds || 0) + '/' + (d.totalRounds || 0) +
+        '</b> 段。⚠ 数字表示该时段「完全无人打卡」的夜数</div>' +
+        '</div></div>';
+    }
 
     // 【卡号体系不一致提示】文案与月报页共用 codeHitWarn，避免两处说法不一致
     h += codeHitWarn(d.codeHitRate, d.monthRecordCount, d.month, d.monthCoverage, 'overview');
@@ -544,7 +585,33 @@ h += '<div class="card mb12"><div class="card-head">数据导入（支持 .xls /
         '<div class="net"><span class="muted">覆盖率</span><b>' + m.coverageRate.toFixed(1) + '%</b></div>' +
         '<div><span class="muted">全巡天数</span><b>' + m.perfectNights + '</b></div>' +
         '<div><span class="muted">全巡率</span><b>' + m.perfectRate.toFixed(1) + '%</b></div>' +
+        '</div>' +
+        // 夜班 5 时段：把分母构成和「时段全巡满」数摊开，避免只看到一个孤立百分比
+        (d.bySegment
+          ? '<div class="muted mt8" style="font-size:12.5px">应巡点次 = ' + (d.pointCount || 0) + ' 点 × <b>5 个时段</b> × ' +
+            m.totalNights + ' 夜；同一时段同一巡点打多次只记 1 次。时段全巡满 <b>' +
+            (m.totalCompleteRounds || 0) + '/' + (m.totalRounds || 0) + '</b> 段</div>' +
+            ((d.excludedNights || []).length
+              ? '<div class="muted mt8" style="font-size:12.5px;color:var(--warn)">未纳入夜班（窗口不完整）：' +
+                U.esc(d.excludedNights.join('、')) + '</div>'
+              : '')
+          : '') +
         '</div></div></div>';
+
+      // 【各时段完成率】夜班专项的核心信息：哪一轮巡不到，直接决定整改优先级
+      if (d.bySegment && (m.segments || []).length) {
+        h += '<div class="card mb12"><div class="card-head">各时段完成率</div><div class="card-body">' +
+          '<div class="chart-bars">' + m.segments.map(s => {
+            const pct = Math.round(s.covered / Math.max(1, s.expected) * 100);
+            const hh = Math.max(6, Math.round(s.rate * 1.3));
+            const color = pct >= 95 ? 'var(--success)' : (pct >= 60 ? 'var(--warn)' : 'var(--danger)');
+            return '<div class="bar-col"><div class="bar-vl">' + s.covered + '/' + s.expected + '</div>' +
+              '<div class="bar-wrap"><div class="bar" style="height:' + hh + 'px;background:' + color +
+              '" title="零打卡夜 ' + (s.zeroNights || 0) + ' 夜"></div></div>' +
+              '<div class="bar-lb">' + U.esc(s.segment) +
+              (s.zeroNights ? ' ⚠' + s.zeroNights : '') + '</div></div>';
+          }).join('') + '</div></div></div>';
+      }
 
       // 【卡号体系不一致提示】月报页与概览页共用同一套文案。
       // 月报更容易让人误解：这里列出了「漏检最多的点位 TOP10」和 1085 条遗漏明细，
@@ -555,7 +622,13 @@ h += '<div class="card mb12"><div class="card-head">数据导入（支持 .xls /
       h += '<div class="grid2 mb12">';
       h += '<div class="card"><div class="card-head">漏检最多的点位（TOP10）</div><div class="card-body tight">' +
         (m.topMissed.length
-          ? Table.render([{ title: '巡更点', key: 'name' }, { title: '漏检次数', key: 'count', width: 100, num: true, render: r2 => U.tag(r2.count + ' 次', r2.count > 5 ? 'red' : 'orange') }], m.topMissed.slice(0, 10))
+          ? Table.render([
+              { title: '巡更点', key: 'name' },
+              { title: '漏巡点次', key: 'count', width: 100, num: true, render: r2 => U.tag(r2.count + ' 次', r2.count > 5 ? 'red' : 'orange') },
+              // 整月一晚都没巡到的点位要单独标出来：这类不是「偶尔漏」，
+              // 而是卡片没激活/设备故障/点位已废弃 —— 处理方式完全不同
+              { title: '巡到夜数', key: 'nightCount', width: 100, num: true, render: r2 => r2.neverChecked ? U.tag('整月未巡', 'red') : (r2.nightCount + ' / ' + m.totalNights) }
+            ], m.topMissed.slice(0, 10))
           : '<div class="empty">本月无漏检 ✔</div>') + '</div></div>';
       h += '<div class="card"><div class="card-head">人员统计</div><div class="card-body tight">' +
         Table.render([

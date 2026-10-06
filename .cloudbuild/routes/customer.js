@@ -119,5 +119,116 @@ module.exports = function (db, router) {
     ok(res, (await db.find('contracts', c.id)));
   });
 
+  // ─── 客户档案导入 ───────────────────────────────────────────────────────────
+
+  /** 下载导入模板（含一行示例数据） */
+  router.get('/api/customer/import/customer-template', async (req, res) => {
+    if (!can(req, res, 'customer:manage')) return fail(res, '无权限');
+    const XLSX = require('../node_modules/xlsx');
+    const fields = [
+      { title: '客户名称', key: 'name' }, { title: '客户类型', key: 'type' },
+      { title: '联系人', key: 'contact' }, { title: '联系电话', key: 'phone' },
+      { title: '通讯地址', key: 'address' }, { title: '统一社会信用代码', key: 'creditCode' },
+      { title: '法人代表', key: 'legalPerson' }, { title: '身份证号', key: 'idCard' },
+      { title: '开户银行', key: 'bankName' }, { title: '银行账号', key: 'bankAccount' },
+      { title: '发票抬头', key: 'invoiceTitle' }, { title: '纳税人识别号', key: 'invoiceTaxNo' },
+      { title: '风险标记', key: 'riskFlag' }, { title: '风险说明', key: 'riskNote' },
+      { title: '状态', key: 'status' }
+    ];
+    // 用 aoa_to_sheet 确保第一行是中文表头，第二行是示例数据
+    const ws = XLSX.utils.aoa_to_sheet([
+      fields.map(f => f.title),
+      fields.map(f => f.title === '客户名称' ? '示例企业客户' : f.title === '客户类型' ? '企业客户' : '')
+    ]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '客户档案');
+    const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    const tplName = '客户档案导入模板.xlsx';
+    res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(tplName) + '"; filename*=UTF-8\'\'' + encodeURIComponent(tplName));
+    res.end(buf);
+  });
+
+  /**
+   * 批量导入客户档案
+   *
+   * 【为什么用 base64 JSON 而不是 FormData 上传】
+   * 服务端 lib/http.js 的 readBody 对 multipart/form-data 只返回 { _raw: Buffer }，
+   * 而这里要的是文件字节；写成 `Array.isArray(req.body)` 会**恒为 false**，
+   * 表现就是「文件为空」—— 前端明明选了文件也传不进来。
+   * 本项目已验证可用的方式是「FileReader 读成 dataURL → JSON 传 fileBase64」，
+   * 与 /api/income/import/recharge 保持一致，本地与 Netlify 两种运行时都走同一套。
+   */
+  router.post('/api/customer/import/customers', async (req, res) => {
+    if (!can(req, res, 'customer:manage')) return fail(res, '无权限');
+    const b = req.body || {};
+    if (!b.fileBase64) return fail(res, '缺少文件');
+
+    const XLSX = require('../node_modules/xlsx');
+
+    // 读取 buffer → xlsx sheet → rows
+    let rows;
+    try {
+      const ab = Buffer.from(String(b.fileBase64).split(',').pop(), 'base64');
+      const wb = XLSX.read(ab, { type: 'array' });
+      rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
+    } catch (e) {
+      return fail(res, 'Excel 解析失败：' + e.message);
+    }
+
+    if (rows.length === 0) return fail(res, '没有数据行');
+
+    let ok_count = 0, failList = [];
+    // 中文表头 → 英文 key 映射
+    const CN2EN = {
+      '客户名称': 'name', '客户类型': 'type', '联系人': 'contact', '联系电话': 'phone',
+      '通讯地址': 'address', '统一社会信用代码': 'creditCode', '法人代表': 'legalPerson',
+      '身份证号': 'idCard', '开户银行': 'bankName', '银行账号': 'bankAccount',
+      '发票抬头': 'invoiceTitle', '纳税人识别号': 'invoiceTaxNo',
+      '风险标记': 'riskFlag', '风险说明': 'riskNote', '状态': 'status'
+    };
+    function normRow(raw) {
+      const out = {};
+      for (const [cn, en] of Object.entries(CN2EN)) {
+        if (raw[en] !== undefined && raw[en] !== '') out[en] = raw[en];
+        else if (raw[cn] !== undefined && raw[cn] !== '') out[en] = raw[cn];
+      }
+      return out;
+    }
+    for (const raw of rows) {
+      const r = normRow(raw);
+      const name = String(r.name || '').trim();
+      if (!name) { failList.push({ row: failList.length + 2, err: '客户名称为空' }); continue; }
+
+      const existing = await db.one('customers', c => c.name === name);
+      if (existing) {
+        // 更新已有记录
+        await db.update('customers', existing.id, {
+          ...r,
+          updatedAt: new Date()
+        });
+        ok_count++;
+      } else {
+        // 新建
+        const id = await db.insert('customers', {
+          ...r,
+          attachments: [],
+          status: r.status || '正常',
+          riskFlag: r.riskFlag || '正常',
+          createDate: new Date().toISOString().slice(0, 10),
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+        if (!id) { failList.push({ row: failList.length + 2, err: '插入失败' }); }
+        else ok_count++;
+      }
+    }
+
+    // 用 ok() 而不是 res.json()：本地 server.js 用的是原生 http ServerResponse，
+    // Netlify 用的是 MiniRes，两者都**没有** res.json() → 直接抛
+    // 「res.json is not a function」，前端只能看到「服务端异常」。
+    ok(res, { total: rows.length, imported: ok_count, errors: failList });
+  });
+
   return router;
 };

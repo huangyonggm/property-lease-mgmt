@@ -60,10 +60,31 @@ class DB {
         const txt = fs.readFileSync(f, 'utf8').trim();
         arr = txt ? JSON.parse(txt) : [];
       } catch (e) {
-        const bak = f + '.bak.' + Date.now();
-        try { fs.copyFileSync(f, bak); } catch (e2) { }
-        console.error('[DB] 数据文件解析失败，已备份为 ' + bak + '，错误：' + e.message);
-        arr = [];
+        // 【严重】原来这里 arr = [] 就完事了 —— 后果是「数据凭空消失」：
+        //   1) 文件截断（写入中断/磁盘满/被杀）→ JSON.parse 失败
+        //   2) 这里静默返回空数组，调用方以为「本来就没数据」
+        //   3) 之后任何一次 persist(name) 都会把空数组写回，
+        //      **原文件被彻底覆盖，真实数据永久丢失**。
+        // 实测踩过：reminders.json（105 条）和 patrolRecords.json（13669 条）
+        // 都这样没了，而且每次都会先备份一个同样损坏的 .bak，
+        // 6 个备份全是坏的，等于没有任何可恢复副本。
+        //
+        // 现在改成：损坏时**抛错**，让请求层返回 500，
+        // 宁可「接口报错」也不能「静默清空数据」。
+        // 同时把损坏文件另存为 .corrupt.<ts> 便于事后修复。
+        const stamp = Date.now();
+        const quarantine = f + '.corrupt.' + stamp;
+        try { fs.copyFileSync(f, quarantine); } catch (e2) { }
+        const err = new Error(
+          '数据文件 ' + path.basename(f) + ' 解析失败（文件可能被截断或损坏），' +
+          '已另存为 ' + path.basename(quarantine) + '。' +
+          '为避免数据被静默清空，本次操作已中止 —— ' +
+          '请先用备份文件修复该文件再继续。原始错误：' + e.message);
+        err.code = 'DB_FILE_CORRUPT';
+        err.file = f;
+        err.quarantine = quarantine;
+        console.error('[DB] ' + err.message);
+        throw err;
       }
     }
     if (!Array.isArray(arr)) arr = [];
@@ -75,6 +96,17 @@ class DB {
     const arr = this.cache.get(name) || [];
     const f = this.file(name);
     const tmp = f + '.tmp';
+    // 【新增】写入前先备份上一版。
+    // 为什么需要：writeFileSync 在磁盘满 / 进程被杀时会留下「写了一半」的文件，
+    // 而且 tmp+rename 的原子性在 NTFS 上也不是 100% 保证。
+    // 没有备份的话，一次异常写入就等于数据永久丢失（实测已发生过）。
+    if (fs.existsSync(f)) {
+      try {
+        const st = fs.statSync(f);
+        // 只在有实质内容时才备份，避免空文件刷出一堆 .bak
+        if (st.size > 0) fs.copyFileSync(f, f + '.bak.' + Date.now());
+      } catch (e2) { }
+    }
     fs.writeFileSync(tmp, JSON.stringify(arr), 'utf8');
     fs.renameSync(tmp, f);
   }

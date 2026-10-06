@@ -82,7 +82,28 @@ function readBody(req) {
   });
 }
 
+/**
+ * 是否已经写过响应头。
+ *
+ * 【为什么需要】`can(req, res, perm)` 鉴权失败时**自己已经写了响应**
+ * （deny() → json() → writeHead），而调用点常写成：
+ *     if (!can(req, res, 'hr:manage')) return fail(res, '无权限');
+ * 于是 fail 又调一次 writeHead →抛 ERR_HTTP_HEADERS_SENT：
+ *     Error [ERR_HTTP_HEADERS_SENT]: Cannot write headers after they are sent
+ * 这个异常发生在 async handler 里，会变成 **unhandledRejection**，
+ * 日志里一片红，而前端早就已经收到 401 了 —— 排查时容易误以为是别的地方坏了。
+ *
+ * 全项目有 10 处这种写法（billing 4 / auth 2 / hr 2 / customer 2），
+ * 逐个改成 `return;` 需要动10 个文件、容易漏，所以在这里做幂等保护：
+ * 响应已发出时，fail/ok 直接静默返回。
+ */
+function headersSent(res) {
+  return !res || res.headersSent || res.writableEnded;
+}
+
 function json(res, data, status) {
+  // 响应已发出：不再重复 writeHead，否则抛 ERR_HTTP_HEADERS_SENT
+  if (headersSent(res)) return;
   const body = JSON.stringify(data === undefined ? null : data);
   res.writeHead(status || 200, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -96,7 +117,9 @@ function ok(res, data, extra) { json(res, Object.assign({ ok: true, data: data =
 function fail(res, msg, status, extra) { json(res, Object.assign({ ok: false, msg: msg || '操作失败' }, extra || {}), status || 400); }
 
 function sendFile(res, filepath, downloadName) {
+  if (headersSent(res)) return;
   fs.readFile(filepath, (err, buf) => {
+    if (headersSent(res)) return;               // 等异步读文件期间可能已被鉴权挡掉
     if (err) { res.writeHead(404); res.end('Not Found'); return; }
     const ext = path.extname(filepath).toLowerCase();
     res.writeHead(200, {

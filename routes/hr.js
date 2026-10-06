@@ -800,19 +800,25 @@ module.exports = function (db, router, opt) {
     res.end(buf);
   });
 
-  /** 批量导入员工档案 */
+  /**
+   * 批量导入员工档案
+   *
+   * 【为什么用 base64 JSON 而不是 FormData 上传】
+   * 见 routes/customer.js 同名注释：lib/http.js 的 readBody 对 multipart 只回
+   * { _raw: Buffer }，`Array.isArray(req.body)` 恒为 false → 前端报「文件为空」。
+   * 统一改为 dataURL(base64) → JSON，与 /api/income/import/recharge 一致。
+   */
   router.post('/api/hr/import/employees', async (req, res) => {
     if (!can(req, res, 'hr:manage')) return fail(res, '无权限');
-    const body = req.body;
-    if (!Array.isArray(body) || body.length === 0) return fail(res, '文件为空');
+    const b = req.body || {};
+    if (!b.fileBase64) return fail(res, '缺少文件');
 
     const XLSX = require('../node_modules/xlsx');
-    const { Buffer } = require('buffer');
 
     // 读取 buffer → xlsx sheet → rows
     let rows;
     try {
-      const ab = Buffer.from(body);
+      const ab = Buffer.from(String(b.fileBase64).split(',').pop(), 'base64');
       const wb = XLSX.read(ab, { type: 'array' });
       rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
     } catch (e) {
@@ -824,7 +830,9 @@ module.exports = function (db, router, opt) {
     const deptMap = await (await db.where('departments')).reduce((m, d) => { m[String(d.id)] = d; return m; }, {});
     const postMap = await (await db.where('posts')).reduce((m, p) => { m[String(p.id)] = p; return m; }, {});
 
-    let ok = 0, dup = 0, failList = [];
+    // ⚠ 计数器不能叫 ok：会遮蔽模块顶部从 lib/http 导入的 ok() 函数，
+    //   导致末尾 ok(res, …) 抛「ok is not a function」。
+    let okCount = 0, updCount = 0, dup = 0, failList = [];
     // 中文表头 → 英文 key 映射（兼容两种表头格式）
     const CN2EN = {
       '工号': 'no', '姓名': 'name', '性别': 'gender',
@@ -860,7 +868,7 @@ module.exports = function (db, router, opt) {
                         'emergencyContact','emergencyPhone','baseSalary','postSalary','bankName','bankCard']),
           updatedAt: new Date()
         });
-        ok++;
+        okCount++; updCount++;
       } else {
         // 新建
         const id = await db.insert('employees', {
@@ -871,11 +879,13 @@ module.exports = function (db, router, opt) {
           createdAt: new Date(), updatedAt: new Date()
         });
         if (!id) { failList.push({ row: failList.length + 2, err: '插入失败' }); }
-        else ok++;
+        else okCount++;
       }
     }
 
-    res.json({ ok: true, total: rows.length, imported: ok, updated: ok - failList.length, skipped: dup, errors: failList });
+    // 用 ok() 而不是 res.json()，原因见 routes/customer.js 同名注释。
+    // updated 单列统计「更新已有工号」的条数（原来写 ok - failList.length，会算出负数）。
+    ok(res, { total: rows.length, imported: okCount, updated: updCount, skipped: dup, errors: failList });
   });
 
   return router;
