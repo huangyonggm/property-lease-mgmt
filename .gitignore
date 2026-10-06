@@ -11,6 +11,9 @@ screenshots/
 .env.*
 !.env.example
 
+# 含阿里云服务器 root 明文密码 —— 绝不提交（本机一键部署脚本）
+一键部署.bat
+
 # 依赖与构建产物
 node_modules/
 .netlify/
