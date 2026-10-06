@@ -618,6 +618,9 @@
       const v = CrudView({
         title: '客户档案', name: '客户', api: '/api/customer/customers', size: 20, formWidth: 'wide', bizType: 'customer',
         exportUrl: '/api/report/export/customers',
+        buttons: [
+          { key: 'import', label: '导入客户', cls: 'btn-primary', onClick: ImportCustomers }
+        ],
         filters: [
           { key: 'type', label: '客户类型', type: 'select', options: ['企业客户', '个人客户'] },
           { key: 'riskFlag', label: '风险标记', type: 'select', options: ['正常', '逾期风险', '违约风险'] }
@@ -699,5 +702,62 @@
       await v.render(el);
     }
   });
+
+  async function ImportCustomers(refresh) {
+    const body = '<div class="import-panel">' +
+      '<p class="muted mb12">支持 .xlsx 文件；客户名称相同则更新，不存在则新建。模板使用中文表头。</p>' +
+      '<button class="btn btn-sm mb12" id="dlTpl">⬇ 下载导入模板</button>' +
+      '<input type="file" id="impFile" accept=".xlsx,.xls" style="display:none">' +
+      '<button class="btn btn-primary" id="impBtn">选择文件并上传</button>' +
+      '<div id="impResult" class="mt12"></div>' +
+      '</div>';
+    UI.open({
+      title: '导入客户档案', width: 480, body,
+      okText: '关闭', cancelText: '',
+      onMount(m) {
+        const fileIn = m.querySelector('#impFile');
+        const dlBtn = m.querySelector('#dlTpl');
+        const btn = m.querySelector('#impBtn');
+        const result = m.querySelector('#impResult');
+        // 下载模板
+        dlBtn.onclick = async () => {
+          dlBtn.disabled = true; dlBtn.textContent = '下载中…';
+          try {
+            const r = await fetch('/api/customer/import/customer-template', { credentials: 'same-origin' });
+            if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+            const blob = await r.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = '客户档案导入模板.xlsx';
+            document.body.appendChild(a); a.click(); a.remove();
+            URL.revokeObjectURL(url);
+          } catch (e) { UI.toast('下载模板失败：' + e.message, 'err'); }
+          finally { dlBtn.disabled = false; dlBtn.textContent = '⬇ 下载导入模板'; }
+        };
+        btn.onclick = () => fileIn.click();
+        fileIn.onchange = async () => {
+          const f = fileIn.files[0];
+          if (!f) return;
+          btn.disabled = true; btn.textContent = '上传中…'; result.innerHTML = '';
+          const fd = new FormData(); fd.append('file', f);
+          try {
+            const r = await fetch('/api/customer/import/customers', { method: 'POST', body: fd, credentials: 'same-origin' });
+            const j = await r.json();
+            if (j.ok) {
+              result.innerHTML = '<div class="tag green">✓ 导入完成：' + j.imported + ' 条记录</div>' +
+                (j.errors && j.errors.length ? '<div class="muted mt8">失败 ' + j.errors.length + ' 行：</div><ul class="muted">' + j.errors.map(e => '<li>第' + e.row + '行：' + e.err + '</li>').join('') + '</ul>' : '');
+              if (j.ok) refresh();
+            } else {
+              result.innerHTML = '<div class="tag red">✗ ' + U.esc(j.msg || '导入失败') + '</div>';
+            }
+          } catch (e) {
+            result.innerHTML = '<div class="tag red">✗ 网络错误：' + U.esc(e.message) + '</div>';
+          } finally {
+            btn.disabled = false; btn.textContent = '选择文件并上传';
+          }
+        };
+      }
+    });
+  }
 
 })();
