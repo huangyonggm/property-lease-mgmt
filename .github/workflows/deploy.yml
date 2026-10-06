@@ -1,0 +1,33 @@
+name: Deploy to Cloudflare Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to Cloudflare Pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          projectName: wuye-zulin
+          directory: public
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          apiToken: ${{ secrets.CF_API_TOKEN }}
