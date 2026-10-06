@@ -4,7 +4,8 @@
  *
  * 【为什么需要这个脚本】
  * 附件接七牛云后，attachments.url 存的是**签名 URL**：
- *   http://tmcv69nvd.hd-bkt.clouddn.com/xxx.png?e=1791075451&token=G70uc44CNpKX6giBZm3j3EcBGdbrWqSC3SeCoHQI&sign=...
+ *   http://<七牛绑定域名>/xxx.png?e=1791075451&token=<QINIU_ACCESS_KEY>:<签名>&sign=...
+ *   （示例已脱敏：真实 AccessKey/SecretKey 一律走 .env 的 QINIU_ACCESS_KEY / QINIU_SECRET_KEY，不入库）
  * 长度 200~300 字符，而原列宽是 VARCHAR(64) → 上传必然报
  *   Error 1406 (22001): Data too long for column 'url' at row 1
  *

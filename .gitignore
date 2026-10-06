@@ -14,6 +14,25 @@ screenshots/
 # 含阿里云服务器 root 明文密码 —— 绝不提交（本机一键部署脚本）
 一键部署.bat
 
+# ===== 实验期部署脚本/配置：内嵌明文生产凭据，绝不提交 =====
+# 内含 Cloudflare API Token + GitHub 账号密码（cf-auto-deploy.js）
+scripts/cf-deploy.js
+scripts/cf-auto-deploy.js
+scripts/deploy_cf.sh
+# 内含 TiDB 账号密码 + 七牛 AccessKey/SecretKey（zeabur-deploy.js / zeabur.json）
+scripts/zeabur-deploy.js
+scripts/zeabur-auto-deploy.js
+scripts/zeabur-auto.js
+zeabur.json
+zeabur_step_*.png
+# 内嵌凭据的迁移/记录文档（如需入库请先脱敏）
+docs/CLOUDFLARE_PAGES_DEPLOY.md
+docs/DEPLOYMENT_COMPLETE.md
+docs/DEPLOY_GUIDE.md
+docs/ZEABUR_DEPLOY.md
+# 临时脚本残留
+clr_tmp*.js
+
 # 依赖与构建产物
 node_modules/
 .netlify/
