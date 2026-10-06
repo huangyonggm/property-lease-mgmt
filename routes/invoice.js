@@ -28,7 +28,9 @@ module.exports = function (db, router) {
     async search(kw, where) {
       return (await db.where('invoices', where)).filter(i =>
         (i.code || '').indexOf(kw) >= 0 || (i.invoiceNo || '').indexOf(kw) >= 0 ||
-        (i.customerName || '').indexOf(kw) >= 0 || (i.contractCode || '').indexOf(kw) >= 0 ||
+        (i.customerName || '').indexOf(kw) >= 0 || (i.sellerName || '').indexOf(kw) >= 0 ||
+        (i.title || '').indexOf(kw) >= 0 ||
+        (i.contractCode || '').indexOf(kw) >= 0 ||
         (i.roomCodes || []).join(',').indexOf(kw) >= 0);
     },
     async decorate(row) {
@@ -37,7 +39,13 @@ module.exports = function (db, router) {
       return o;
     },
     validate(b) {
-      if (!b.customerId) return '请选择开票客户';
+      // 开票客户不再是硬性要求：票面购买方（发票抬头）也认。
+      // 理由：用户上传的票未必对应客户档案里的客户（例如一张进项票），
+      // 强行要求先建档会让「识别出来是什么就是什么」变成「先去客户档案凑一个」。
+      // 但两者必须有一个，否则台账上这张票就没人可归了。
+      if (!b.customerId && !String(b.title || '').trim()) {
+        return '请选择开票客户，或填写发票抬头（票面购买方）';
+      }
       if (!b.amount || num(b.amount) <= 0) return '开票金额必须大于 0';
       return null;
     },
@@ -46,6 +54,10 @@ module.exports = function (db, router) {
       b.code = b.code || db.nextNo('invoices', 'FP', today());
       b.by = (req.u || {}).name || ''; b.byId = req.user.id;
       b.status = b.status || '已开具';
+      // 没挂客户档案时，用票面购买方名称兜底 customerName，
+      // 保证列表「客户」列、关键字搜索、报表按客户汇总都还能看到这张票是谁的。
+      if (!b.customerName) b.customerName = String(b.title || '').trim();
+      b.sellerName = String(b.sellerName || '').trim();
       // 票面 PDF/图片附件（JSON 列，云端以文本存、读时自动还原成数组）。
       // 新增时表单若没走附件控件（如「按账单拆分开票」生成的票），兜底成空数组，
       // 避免列表页 render 里 (r.attachments || []) 之外的地方读到 undefined。
