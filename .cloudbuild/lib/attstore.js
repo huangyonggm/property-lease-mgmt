@@ -177,13 +177,24 @@ async function qiniuProto() {
 }
 
 function qiniuUrl(key) {
-  const d = process.env.QINIU_DOMAIN || '';
+  // 防御性清洗：万一环境变量被 systemd EnvironmentFile 把行内注释带进来
+  // （见 2026-10-06 那次事故），这里也保证签不出「域名+注释」的脏 URL。
+  const d = String(process.env.QINIU_DOMAIN || '').split('#')[0].trim();
   if (!d) return key;                 // 未配域名时只返回 key，由前端拼
   if (process.env.QINIU_PRIVATE !== '1') return 'https://' + d + '/' + key;
   const { qiniu, mac, config } = getQiniu();
   const expire = Number(process.env.QINIU_URL_EXPIRE || 3600);
   const deadline = Math.floor(Date.now() / 1000) + expire;
-  const p = _proto === 'http' ? 'http' : 'https';
+  // 协议优先级：显式 FORCE 环境变量 > 已探测结果 > 默认 https
+  //
+  // 【为什么要读 FORCE 环境变量】lib/http.js 的 ok() 会**同步**按 key 重签附件 URL，
+  // 那里没法 await 异步的协议探测（qiniuProto）；而探测前 _proto 仍是 null，
+  // 会签出 https —— 七牛测试域名的证书不覆盖该域名，浏览器直接报
+  // 「连接不是私密连接」(ERR_TLS_CERT_ALTNAME_INVALID)。
+  // 所以未绑自定义域名时，用 QINIU_FORCE_HTTP=1 固定走 http。
+  const forced = process.env.QINIU_FORCE_HTTPS === '1' ? 'https'
+    : (process.env.QINIU_FORCE_HTTP === '1' ? 'http' : null);
+  const p = forced || (_proto === 'http' ? 'http' : 'https');
   return new qiniu.rs.BucketManager(mac, config).privateDownloadUrl(p + '://' + d, key, deadline);
 }
 

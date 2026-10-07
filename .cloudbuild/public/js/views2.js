@@ -709,8 +709,22 @@
    *   「编辑」时表单里本来就是这条发票的真实数据，上传一张附件就把发票号码/
    *   金额冲掉属于数据破坏；而「新增」时核心字段是空的（开票日期除外，它有
    *   「今天」的默认值，正好该被票面日期覆盖），让识别结果填进去才是目的。
+   *
+   * 【票面两方与表单的对应关系】（按用户要求：识别出来是什么就是什么）
+   *   票面「销售方」（谁开的这张票） → 表单「开票方（票面销售方）」= sellerName
+   *   票面「购买方」（票开给谁）     → 表单「发票抬头（票面购买方）」= title
+   *   两个字段都是**纯文本**，OCR 出什么写什么，不做任何改写。
+   *
+   * 【为什么「开票客户」不无条件自动选】
+   *   它是客户档案的外键下拉。以前是 required，浏览器默认选中下拉第 1 项，
+   *   看起来像「系统把客户识别成了某某公司」——其实 OCR 根本没碰它。
+   *   现在的规则：**票面购买方与客户档案里的客户名完全同名（trim 后 ===）才自动选中**；
+   *   匹配不到就保持「— 请选择 —」，并明确告诉用户没匹配上，**绝不按关键字/首项兜底猜测**
+   *   （机械 first-match 会把发票挂到错误客户上，比空着危害大得多）。
+   *
+   * @returns {Promise<void>}
    */
-  function FillInvoiceOcr(mask, o, isEdit) {
+  async function FillInvoiceOcr(mask, o, isEdit) {
     const setVal = (key, val) => {
       if (val === '' || val === null || val === undefined) return false;
       const el = mask.querySelector('[data-f="' + key + '"]');
@@ -730,20 +744,51 @@
     if (setVal('invoiceDate', o.date)) filled.push('开票日期');
     if (setVal('amount', o.tax_included)) filled.push('开票金额（价税合计 ' + U.money(o.tax_included) + ' 元）');
     if (setVal('taxRate', o.tax_rate)) filled.push('税率 ' + o.tax_rate + '%');
-    // 【辅助字段】本系统记录的是开给客户的销项发票 ⇒ 票面「购买方」= 开票客户，
-    // 对应表单的「发票抬头」；「销售方」（本公司）不填。
-    if (setVal('title', o.buyer)) filled.push('发票抬头');
+    // 【票面两方】原样落到文本字段，不做任何档案匹配或改写。
+    // 「开票方」= 票面销售方（谁开的票）；「发票抬头」= 票面购买方（票开给谁）。
+    const seller = String(o.seller || '').trim();
+    const buyer = String(o.buyer || '').trim();
+    if (setVal('sellerName', seller)) filled.push('开票方「' + seller + '」');
+    if (setVal('title', buyer)) filled.push('发票抬头「' + buyer + '」');
     if (setVal('taxNo', o.buyer_tax_no)) filled.push('纳税人识别号');
     if (setVal('bankInfo', o.buyer_bank)) filled.push('开户行及账号');
     if (setVal('address', o.buyer_addr)) filled.push('地址电话');
 
-    if (filled.length) {
-      UI.toast('已自动识别并填入：' + filled.join('、') + '，请核对后保存', 'ok');
-      return;
+    // 【开票客户】只有当票面购买方与客户档案里的客户名**完全同名**时才自动关联；
+    // 匹配不到就退回「— 请选择 —」并明确说明，绝不按关键字/首项兜底猜测。
+    let unmatched = '';
+    const sel = mask.querySelector('[data-f="customerId"]');
+    if (sel && !(isEdit && String(sel.value || '').trim() !== '')) {
+      let hit = null;
+      if (buyer) {
+        try {
+          const list = await Cache.customers();
+          hit = (list || []).find(c => String(c.name || '').trim() === buyer) || null;
+        } catch (e) { hit = null; }
+      }
+      if (hit) {
+        sel.value = hit.id;
+        filled.push('开票客户（与票面购买方同名，已自动关联）');
+      } else {
+        // 仅在存在空占位项时才清空，避免某些表单没渲染占位导致选中项乱跳
+        const hasEmpty = Array.prototype.some.call(sel.options, op => op.value === '');
+        if (hasEmpty) sel.value = '';
+        if (buyer) unmatched = buyer;
+      }
+      sel.dispatchEvent(new Event('input', { bubbles: true }));
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    const gotSomething = !!(o.invoice_no || o.date || o.tax_included !== '');
-    if (gotSomething && isEdit) UI.toast('已识别到票面信息，但表单对应字段已有内容，未做覆盖', '');
-    else UI.toast('识别完成，但未取到可回填的字段，请手工填写', 'err');
+
+    // 只弹一条提示：已填了什么 + 客户为什么没关联上（显式说明，避免被误解成"识别错了"）
+    if (filled.length) {
+      let msg = '已按票面原样填入：' + filled.join('、');
+      if (unmatched) msg += '。票面购买方「' + unmatched + '」在客户档案中没有同名客户，开票客户未自动关联（名称已填入发票抬头，可直接保存，也可手动选择客户）';
+      UI.toast(msg + '，请核对后保存', 'ok');
+    } else {
+      const gotSomething = !!(o.invoice_no || o.date || o.tax_included !== '');
+      if (gotSomething && isEdit) UI.toast('已识别到票面信息，但表单对应字段已有内容，未做覆盖', '');
+      else UI.toast('识别完成，但未取到可回填的字段，请手工填写', 'err');
+    }
   }
 
   /**
@@ -777,7 +822,9 @@
           const r = await POST('/api/system/upload', { fileName: f.name, dataBase64: dataUrl, bizType: 'invoice' });
           if (!r.ok) { UI.toast('附件上传失败：' + (r.msg || ''), 'err'); continue; }
           if (r.data) { arr.push(r.data); store.value = JSON.stringify(arr); Form.renderFiles(mask, 'attachments'); }
-          if (r.ocr) FillInvoiceOcr(mask, r.ocr, isEdit);
+          // 回填是 async（内部要查客户档案做同名匹配），必须 await，
+          // 否则按钮文案会在填表完成前就恢复，多张票连续上传时回填结果互相覆盖。
+          if (r.ocr) await FillInvoiceOcr(mask, r.ocr, isEdit);
           else if (r.ocr_error) UI.toast('发票识别未完成：' + r.ocr_error + '（附件已保存，可手工填写）', 'err');
           // 两个都没有：后端未启用识别（旧版本），静默即可，不影响附件
         }
@@ -813,6 +860,8 @@
           { title: '类型', key: 'type', width: 100, render: r => U.tag(r.type, r.type === '增值税专票' ? 'blue' : 'cyan') },
           { title: '内容', key: 'category', width: 80, render: r => U.tag(r.category, 'purple') },
           { title: '客户', key: 'customerName', width: 170 },
+          // 票面销售方（谁开的这张票）。原样展示，便于一眼核对识别结果。
+          { title: '开票方', key: 'sellerName', width: 170, render: r => r.sellerName ? U.esc(r.sellerName) : '<span class="muted">—</span>' },
           { title: '房号', key: 'roomCodes', width: 140, render: r => '<span class="muted">' + U.esc((r.roomCodes || []).join('、')) + '</span>' },
           { title: '金额', key: 'amount', width: 100, num: true },
           { title: '税率', key: 'taxRate', width: 60, render: r => (r.taxRate || 0) + '%' },
@@ -848,7 +897,12 @@
           { key: 'tpl', label: '发票模板', onClick: () => ShowTemplates() }
         ],
         fields: [
-          { key: 'customerId', label: '开票客户', type: 'select', options: [], optionsFrom: 'customers', required: true },
+          // 【为什么开票客户刻意不设 required】components.js 的 Form.html 里，
+          //   只有 `!f.required` 的下拉才会渲染「— 请选择 —」占位项；
+          //   一旦设成 required，浏览器就默认选中下拉第 1 项（客户档案里第一个客户），
+          //   看起来像「系统把开票客户识别成了某某公司」—— 实际 OCR 根本没碰它。
+          //   现在默认空着；OCR 只在票面购买方与客户档案**完全同名**时才自动选中。
+          { key: 'customerId', label: '开票客户（选填）', type: 'select', options: [], optionsFrom: 'customers' },
           { key: 'type', label: '发票类型', type: 'select', options: ['增值税普票', '增值税专票'], default: '增值税普票' },
           { key: 'category', label: '开票内容', type: 'select', options: ['租金', '物业费', '电费', '水费', '杂费', '保洁费'], required: true },
           { key: 'invoiceNo', label: '发票号码' },
@@ -856,13 +910,18 @@
           { key: 'amount', label: '开票金额', type: 'number', required: true },
           { key: 'taxRate', label: '税率(%)', type: 'number', default: 9 },
           { key: 'template', label: '发票模板', type: 'select', options: ['模板1', '模板2', '模板3', '模板4'], default: '模板1' },
-          { key: 'title', label: '发票抬头' },
+          // 票面「销售方」：谁开的这张票。原样接住，不做任何档案匹配。
+          { key: 'sellerName', label: '开票方（票面销售方）' },
+          // 票面「购买方」：这张票开给谁。原来是必选的「开票客户」下拉，现在放开成文本。
+          { key: 'title', label: '发票抬头（票面购买方）' },
           { key: 'taxNo', label: '纳税人识别号' },
           { key: 'bankInfo', label: '开户行及账号' },
           { key: 'address', label: '地址电话' },
           {
             key: 'attachments', label: '票面附件（PDF / 图片）', type: 'files', span: 'full',
-            hint: '上传发票 PDF 或票面照片后，系统会自动识别「发票号码 / 开票日期 / 价税合计 / 税率」并填入上方字段，请核对无误后再保存。未配置识别凭据或识别失败时，附件照常保存，手工填写即可。'
+            hint: '上传发票 PDF 或票面照片后，系统会把票面上的「发票号码 / 开票日期 / 价税合计 / 税率 / 开票方（销售方）/ 发票抬头（购买方）」按票面原样填入上方字段，请核对无误后再保存。' +
+              '「开票客户」只在票面购买方与客户档案里有同名客户时才会自动关联，没匹配上会保持未选择并提示，不会替你猜。' +
+              '未配置识别凭据或识别失败时，附件照常保存，手工填写即可。'
           },
           { key: 'remark', label: '备注', span: 'full', type: 'textarea' }
         ],

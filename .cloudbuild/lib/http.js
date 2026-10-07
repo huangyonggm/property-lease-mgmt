@@ -113,7 +113,79 @@ function json(res, data, status) {
   res.end(body);
 }
 
-function ok(res, data, extra) { json(res, Object.assign({ ok: true, data: data === undefined ? null : data }, extra || {})); }
+/* ===================== 附件 URL 实时重签 =====================
+ *
+ * 【为什么必须做这件事】
+ * `lib/attstore.js` 的 put() 在七牛「私有桶」模式下返回的是**带签名的临时链接**
+ * （`?e=<过期时间戳>&token=<AK>:<sign>`，默认 1 小时），而 `routes/ops.js:205`
+ * 会把 put() 的返回值原样落库（`url: stored.url`）。于是库里存的 url 有两类坏形态：
+ *   · 签名链接 → **1 小时后必然 401**（临时凭证被当成永久地址存了）
+ *   · 纯基址  → 私有桶拒绝无签名请求；且七牛测试域名的证书不覆盖该域名，
+ *               浏览器直接 ERR_TLS_CERT_ALTNAME_INVALID（「连接不是私密连接」）
+ * 前端（components.js 的文件芯片、客户详情、发票列表票面列）又是**直接**用
+ * `a.url` 打开的，所以表现为「附件点开打不开」。
+ *
+ * 【修法】库里已经存了 `key`，所以每次响应前按 key 重新签名 —— 链接永远新鲜。
+ * 放在 ok() 这个全站唯一出口，一处改动覆盖所有页面，不必改 N 个路由。
+ *
+ * 【为什么必须返回新对象，绝不能就地改】
+ * data 往往就是 db 内存缓存里的对象引用（本地 JSON 引擎 / TiDB 请求级缓存）。
+ * 就地改会把这一秒生成的临时签名写回缓存，下一次 persist 就把它落库了 ——
+ * 那正是我们要避免的事。所以只在命中附件对象时浅拷贝一个新对象。
+ */
+const ATT_DEPTH_MAX = 8;
+
+/** 判断是否「可重签的附件对象」；是则返回它的 key，否则返回 null */
+function attKeyOf(x) {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
+  if (typeof x.key !== 'string' || !x.key) return null;
+  if (x.storage === 'qiniu') return x.key;
+  // 老记录没有 storage 字段：url 里带七牛域名（含被注释污染的脏域名，前缀仍能命中）也算
+  const dom = process.env.QINIU_DOMAIN || '';
+  if (dom && typeof x.url === 'string' && x.url.indexOf(dom) >= 0) return x.key;
+  return null;
+}
+
+let _attStore = null;            // 懒加载，避免 http.js 启动时就拉进七牛 SDK
+function attStoreInstance() {
+  if (_attStore !== undefined && _attStore !== null) return _attStore;
+  try {
+    const { AttStore } = require('./attstore');
+    _attStore = new AttStore(process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads'));
+  } catch (e) {
+    _attStore = null;            // 附件存储不可用时静默跳过，绝不阻断业务响应
+  }
+  return _attStore;
+}
+
+function resignAttUrls(v, depth) {
+  if (v === null || typeof v !== 'object' || depth > ATT_DEPTH_MAX) return v;
+  if (Array.isArray(v)) {
+    let changed = false;
+    const out = v.map(x => { const n = resignAttUrls(x, depth + 1); if (n !== x) changed = true; return n; });
+    return changed ? out : v;    // 无变化就沿用原引用，省内存/省 GC
+  }
+  const key = attKeyOf(v);
+  if (key) {
+    let u = null;
+    try { const s = attStoreInstance(); if (s) u = s.url(key); } catch (e) { u = null; }
+    if (u && u !== v.url) return Object.assign({}, v, { url: u });
+    return v;
+  }
+  let changed = false;
+  const out = {};
+  for (const k of Object.keys(v)) {
+    const n = resignAttUrls(v[k], depth + 1);
+    out[k] = n;
+    if (n !== v[k]) changed = true;
+  }
+  return changed ? out : v;
+}
+
+function ok(res, data, extra) {
+  const body = data === undefined ? null : resignAttUrls(data, 0);
+  json(res, Object.assign({ ok: true, data: body }, extra || {}));
+}
 function fail(res, msg, status, extra) { json(res, Object.assign({ ok: false, msg: msg || '操作失败' }, extra || {}), status || 400); }
 
 function sendFile(res, filepath, downloadName) {
