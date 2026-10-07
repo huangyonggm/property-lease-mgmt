@@ -1,9 +1,12 @@
 'use strict';
 /* 合同模板比对 —— 把招商部上报的合同与标准模板 / 系统数据逐项核对并标红
  *
- * 三个界面：
- *   ContractCompareUpload   上传比对（选合同 + 传文件 → 出差异清单）
- *   ContractCompareLedger   全部比对记录台账
+ * 两个入口共用一套界面：
+ *   ContractCompareUpload   上传比对
+ *                           ① 选「待审合同」→ 合同还没录入系统、还没有编号，
+ *                              只与标准模板核对 + 自动查系统里的重复签约
+ *                           ② 选具体合同 → 连同系统档案数据逐项核对
+ *   ContractCompareLedger   全部比对记录台账（含待审比对）
  *   ContractCompareTemplate 标准模板清单（给业务方对照"该长什么样"）
  *
  * 后端：routes/contractcmp.js；引擎：lib/contractCompare.js
@@ -32,7 +35,14 @@
   };
 
   /* ---------------- 差异详情弹窗 ---------------- */
-  function diffDetail(r) {
+  /**
+   * @param {object} r    引擎返回的 result
+   * @param {object} ctx  { fileName, fileBase64, mode, contractId, skipNumberCompare, related }
+   *                      —— 待审模式与「存入台账」需要这些上下文
+   */
+  function diffDetail(r, ctx) {
+    const c = ctx || {};
+    const pending = r.mode === 'pending' || !!r.pending;
     const rows = (r.diffs || []).map(d => {
       const s = SEV[d.severity] || SEV.low;
       return {
@@ -46,8 +56,66 @@
       };
     });
     const v = VERDICT[r.verdict] || VERDICT.review;
+
+    /* ---- 待审合同：识别到的关键信息（人工核对用） ---- */
+    let extractedHtml = '';
+    if (pending && (r.extracted || []).length) {
+      const exRows = r.extracted.map(e => ({
+        label: U.esc(e.label) + (e.required ? ' <span class="tag red">必填</span>' : ''),
+        val: e.found
+          ? '<b>' + U.esc(e.value) + '</b>' + (e.unit ? ' <span class="muted">' + U.esc(e.unit) + '</span>' : '')
+          : '<span style="color:var(--danger)">未找到</span>',
+        note: '<span class="muted" style="font-size:11px">' + U.esc(e.note || '') + '</span>'
+      }));
+      extractedHtml =
+        '<h4 class="mt12 mb8">合同文本识别到的关键信息（请与纸质合同逐项核对）</h4>' +
+        Table.render([
+          { title: '项目', key: 'label', width: 190 },
+          { title: '合同里填的内容', key: 'val', width: 220 },
+          { title: '说明', key: 'note' }
+        ], exRows);
+    }
+
+    /* ---- 待审合同：系统关联核查 ---- */
+    let relatedHtml = '';
+    const rel = c.related;
+    if (pending && rel) {
+      const items = [];
+      (rel.rooms || []).forEach(x => {
+        const color = x.busy ? 'var(--danger)' : (x.exists ? 'var(--warning)' : 'var(--success)');
+        const txt = x.busy
+          ? '系统里已有在租合同 ' + x.busyBy + '　→ 注意是否重复签约'
+          : (x.exists ? '系统里有历史合同，当前无在租' : '系统里没有该房号的记录（新房号？）');
+        items.push('<div style="margin:4px 0"><span style="color:' + color + '">●</span> 房号 <b>' +
+          U.esc(x.raw) + '</b>：' + U.esc(txt) + '</div>');
+      });
+      if ((rel.code || []).length) {
+        items.push('<div style="margin:4px 0;color:var(--danger)">● 合同上的编号在系统里<b>已存在</b>：' +
+          rel.code.map(x => U.esc(x.code) + '（' + U.esc(x.customerName || '') + '）').join('、') + '</div>');
+      }
+      if ((rel.customer || []).length) {
+        items.push('<div style="margin:4px 0">● 承租方在系统里已有 <b>' + rel.customer.length + '</b> 份合同：' +
+          rel.customer.slice(0, 5).map(x => U.esc(x.code) + '/' + U.esc(x.status || '') +
+            (x.roomCodes && x.roomCodes.length ? '(' + U.esc(x.roomCodes.join('、')) + ')' : '')).join('　') + '</div>');
+      }
+      if (!items.length) items.push('<div class="muted" style="margin:4px 0">没有从文本里识别到可核查的编号 / 房号 / 承租方</div>');
+      relatedHtml =
+        '<h4 class="mt12 mb8">系统关联核查 <span class="muted" style="font-weight:400;font-size:12px">' +
+        '（只作提示，不影响比对结论）</span></h4>' +
+        '<div style="background:var(--panel-2);border:1px solid var(--border);border-radius:8px;' +
+        'padding:10px 12px;font-size:13px">' + items.join('') + '</div>';
+    }
+
     const body =
       '<div style="padding:4px 2px 12px">' +
+      (pending
+        ? '<div style="background:var(--primary-soft);border:1px solid var(--primary);border-radius:8px;' +
+          'padding:10px 12px;margin-bottom:12px;font-size:12.5px;line-height:1.7">' +
+          '<b>待审合同比对</b>（未录入系统、无编号）：本次<b>未与系统数据核对</b>，' +
+          '只核对「与标准模板的条款一致性 / 各槽位填写完整性与格式 / 占位符残留 / 金额大小写自洽」。<br>' +
+          '合同录入系统后，可以再做一次「系统合同比对」补上金额 / 面积 / 日期的核对。' +
+          '</div>'
+        : '') +
       '<div style="display:flex;gap:14px;align-items:center;margin-bottom:10px;flex-wrap:wrap">' +
       '<span class="tag ' + v.tag + '" style="font-size:13px;padding:4px 10px">' + v.label + '</span>' +
       '<span style="font-size:20px;font-weight:700;color:' +
@@ -63,6 +131,9 @@
       '<span>识别 ' + (r.kind || '') + ' / ' + (r.paraCount || 0) + ' 段 / ' + (r.docChars || 0) + ' 字</span>' +
       '</div>' +
       (r.warn && r.warn.length ? '<div class="muted" style="font-size:12px;margin-bottom:8px">⚠ ' + U.esc(r.warn.join('；')) + '</div>' : '') +
+      relatedHtml +
+      extractedHtml +
+      '<h4 class="mt12 mb8">与标准模板的差异（' + rows.length + ' 项）</h4>' +
       (rows.length
         ? Table.render([
             { title: '', key: 'sev', width: 62 },
@@ -73,11 +144,54 @@
             { title: '原文证据', key: 'ev', width: 150 }
           ], rows)
         : '<div style="padding:24px;text-align:center;color:var(--success)">✔ 未发现与标准模板的差异</div>') +
+      '<div style="margin-top:14px;display:flex;gap:8px;align-items:center">' +
+      (canManage()
+        ? '<button class="btn btn-primary" id="ccSaveBtn"' + (c.fileBase64 ? '' : ' disabled') + '>存入比对台账</button>'
+        : '') +
+      '<span class="muted" style="font-size:11.5px">' +
+      (canManage()
+        ? (pending
+            ? '待审比对会留档，台账里标记为「待审」（不挂任何合同）'
+            : '存档会同时把文件挂到该合同的附件里')
+        : '当前账号没有 contract:manage 权限，无法存档') +
+      '</span>' +
+      '</div>' +
       '</div>';
 
     UI.open({
-      title: '合同模板比对结果', width: 'wide', hideCancel: true,
-      body: body
+      title: pending ? '待审合同比对结果' : '合同模板比对结果', width: 'wide', hideCancel: true,
+      body: body,
+      onMount(mask) {
+        const btn = mask.querySelector('#ccSaveBtn');
+        if (btn) btn.onclick = () => saveToLedger(btn, c);
+      }
+    });
+  }
+
+  /* ---------------- 存入比对台账 ---------------- */
+  function saveToLedger(btn, ctx) {
+    const c = ctx || {};
+    if (!c.fileBase64) { UI.toast('原始文件已不在内存，请重新上传后再存档', 'err'); return; }
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = '存档中…';
+    POST('/api/contract-compare/save', {
+      contractId: c.contractId || '',
+      fileName: c.fileName || '',
+      skipNumberCompare: !!c.skipNumberCompare,
+      note: c.mode === 'pending' ? '待审合同比对（未录入系统档案）' : '',
+      dataBase64: c.fileBase64
+    }).then(r => {
+      if (!r || r.ok === false) {
+        UI.toast('存档失败：' + ((r && r.msg) || '接口无返回'), 'err');
+        btn.disabled = false; btn.textContent = old;
+        return;
+      }
+      UI.toast('已存入比对台账', 'ok');
+      btn.textContent = '已存档 ✔';
+      btn.disabled = true;
+    }).catch(e => {
+      UI.toast('存档失败：' + (e.message || e), 'err');
+      btn.disabled = false; btn.textContent = old;
     });
   }
 
@@ -88,24 +202,29 @@
       const r = await GET('/api/contract/contracts?pageSize=500');
       contracts = (r.data && r.data.list) || [];
     } catch (e) { UI.toast('读取合同列表失败：' + e.message, 'err'); return; }
-    if (!contracts.length) { UI.toast('系统里还没有合同', 'err'); return; }
+    // ⚠ 合同列表为空也要能进界面：待审比对本来就不需要系统里有合同
+
+    const PENDING = '__pending__';
+    // 默认进「待审合同」：招商部新签的合同都是先拿来做比对、后录档案的
+    let cid = presetContractId || PENDING;
+    if (presetContractId && !contracts.some(c => c.id === presetContractId)) cid = PENDING;
+    let file = null;
+    let fileBase64 = '';
+    let skipNo = true;
 
     const opts = contracts.map(c => ({
       v: c.id,
       t: c.code + '　' + c.customerName + '　' + (c.roomCodes || []).join('/')
     }));
-    let cid = presetContractId || (contracts[0] && contracts[0].id);
-    let file = null;
-    let skipNo = true;
-
     const body =
       '<div class="form-grid" style="gap:14px">' +
       '<div class="form-item" style="grid-column:1/-1">' +
-      '<label>比对哪份合同</label>' +
-      '<select id="ccCid">' + opts.map(o =>
-        '<option value="' + U.esc(o.v) + '"' + (o.v === cid ? ' selected' : '') + '>' + U.esc(o.t) + '</option>'
-      ).join('') + '</select>' +
-      '<div class="muted" style="font-size:11px;margin-top:3px">系统里没有的合同（招商部新签的）需先在合同管理中录入</div>' +
+      '<label>比对对象</label>' +
+      '<select id="ccCid">' +
+      '<option value="' + PENDING + '"' + (cid === PENDING ? ' selected' : '') + '>待审合同 —— 还没录入系统、还没有编号</option>' +
+      opts.map(o => '<option value="' + U.esc(o.v) + '"' + (o.v === cid ? ' selected' : '') + '>' + U.esc(o.t) + '</option>').join('') +
+      '</select>' +
+      '<div class="muted" style="font-size:11px;margin-top:3px" id="ccModeTip"></div>' +
       '</div>' +
       '<div class="form-item" style="grid-column:1/-1">' +
       '<label>上传上报的合同文件</label>' +
@@ -125,17 +244,28 @@
       '</div>' +
       '</div>';
 
+    const tipOf = (v) => v === PENDING
+      ? '待审合同：只与标准模板核对（条款 / 填写完整性 / 格式 / 占位符），' +
+        '并自动查一遍系统里有没有「同房号已签出 / 编号撞车 / 承租方已有合同」。'
+      : '系统合同：连同系统档案数据（编号 / 金额 / 面积 / 起止日期）逐项核对。';
+
     UI.open({
       title: '合同模板比对', width: 'wide',
       okText: '开始比对', cancelText: '关闭',
       body: body,
       onMount(mask) {
         window.__ccMask = mask;
+        const tip = mask.querySelector('#ccModeTip');
+        if (tip) tip.textContent = tipOf(cid);
         const sel = mask.querySelector('#ccCid');
-        if (sel) sel.onchange = () => { cid = sel.value; };
+        if (sel) sel.onchange = () => {
+          cid = sel.value;
+          if (tip) tip.textContent = tipOf(cid);
+        };
         const f = mask.querySelector('#ccFile');
         if (f) f.onchange = () => {
           file = f.files && f.files[0];
+          fileBase64 = '';
           const box = mask.querySelector('#ccPick');
           if (box) {
             box.innerHTML = file
@@ -149,14 +279,18 @@
       onOk() {
         if (!file) { UI.toast('请先选择要比对的合同文件', 'err'); return false; }
         if (file.size > 30 * 1024 * 1024) { UI.toast('文件超过 30MB', 'err'); return false; }
+        const isPending = cid === PENDING;
         const rd = new FileReader();
         rd.onload = () => {
-          POST('/api/contract-compare/check', {
-            contractId: cid,
+          fileBase64 = String(rd.result).split(',')[1] || '';
+          const payload = {
             fileName: file.name,
             skipNumberCompare: skipNo,
-            dataBase64: String(rd.result).split(',')[1] || ''
-          }).then(r => {
+            dataBase64: fileBase64
+          };
+          // 待审合同不传 contractId —— 后端据此走「无系统档案」分支
+          if (!isPending) payload.contractId = cid;
+          POST('/api/contract-compare/check', payload).then(r => {
             // 【防御】POST 不会因业务失败而 throw（只有 401 / 网络异常才 throw），
             // 失败时返回 { ok:false, msg }，此时 r.data 是 undefined。
             // 之前直接 r.data.result 会抛「Cannot read properties of undefined」，
@@ -172,7 +306,13 @@
             }
             // 关掉上传弹窗，再开结果弹窗
             if (window.__ccMask) { window.__ccMask.remove(); window.__ccMask = null; }
-            setTimeout(() => diffDetail(res), 150);
+            setTimeout(() => diffDetail(res, {
+              fileName: file.name, fileBase64: fileBase64,
+              mode: r.data.mode || res.mode || '',
+              contractId: isPending ? '' : cid,
+              skipNumberCompare: skipNo,
+              related: r.data.related || null
+            }), 150);
             UI.toast('比对完成：' + (VERDICT[res.verdict] || {}).label + '，得分 ' + res.score, res.verdict === 'pass' ? 'ok' : 'warn');
           }).catch(e => UI.toast('比对失败：' + (e.message || e), 'err'));
         };
@@ -191,7 +331,9 @@
     const rows = list.map(x => {
       const v = VERDICT[x.verdict] || VERDICT.review;
       return {
-        code: x.contractCode,
+        code: x.pending
+          ? U.tag('待审·未录入', 'orange') + (x.contractCode ? ' <span class="mono">' + U.esc(x.contractCode) + '</span>' : '')
+          : U.esc(x.contractCode || ''),
         file: U.esc(x.fileName || ''),
         type: U.tag((x.fileType || '').toUpperCase(), 'cyan'),
         score: '<b style="color:' + (x.score >= 90 ? 'var(--success)' : x.score >= 60 ? 'var(--warning)' : 'var(--danger)') + '">' + x.score + '</b>',
@@ -207,16 +349,20 @@
     UI.open({
       title: '合同模板比对台账', width: 'wide', hideCancel: true,
       body:
-        '<div style="display:flex;gap:16px;padding:6px 2px 12px;font-size:13px" class="muted">' +
+        '<div style="display:flex;gap:16px;padding:6px 2px 12px;font-size:13px;flex-wrap:wrap" class="muted">' +
         '<span>共 <b>' + (st.total || 0) + '</b> 次比对</span>' +
         '<span style="color:var(--success)">通过 ' + (st.pass || 0) + '</span>' +
         '<span style="color:var(--warning)">需复核 ' + (st.review || 0) + '</span>' +
         '<span style="color:var(--danger)">不通过 ' + (st.reject || 0) + '</span>' +
         '<span style="color:var(--cyan)">需OCR ' + (st.needOcr || 0) + '</span>' +
+        '<span style="color:var(--orange)">待审·未录入 ' + (st.pending || 0) + '</span>' +
         '</div>' +
+        '<div class="muted" style="font-size:11.5px;margin:-6px 0 10px">' +
+        '「待审·未录入」= 比对时合同还没录入系统（无编号），只与标准模板核对；' +
+        '合同录入系统后请再做一次「系统合同比对」。</div>' +
         (rows.length
           ? Table.render([
-              { title: '合同号', key: 'code', width: 150 },
+              { title: '合同号', key: 'code', width: 170 },
               { title: '上报文件', key: 'file' },
               { title: '格式', key: 'type', width: 60 },
               { title: '得分', key: 'score', width: 60, num: true },
