@@ -125,7 +125,14 @@ function json(res, data, status) {
  * 前端（components.js 的文件芯片、客户详情、发票列表票面列）又是**直接**用
  * `a.url` 打开的，所以表现为「附件点开打不开」。
  *
- * 【修法】库里已经存了 `key`，所以每次响应前按 key 重新签名 —— 链接永远新鲜。
+ * 【修法】库里已经存了 `key`，所以每次响应前按 key 把前端用的地址重写为
+ * **本机的预览代理** `/api/attachment/file?key=…`（见 routes/ops.js）。
+ * 为什么不直接用七牛签名直链：七牛私有空间的下载链接**一律返回
+ * `Content-Disposition: attachment`**（实测即使在 URL 上附加
+ * response-content-disposition=inline 并让它参与签名也无效），浏览器只会下载、
+ * 不会内联显示 —— 发票 PDF 的 iframe 在线预览因此失效。
+ * 走本机代理则：① 能内联预览；② 天然鉴权（未登录看不到敏感件）；③ 地址永不失效。
+ *
  * 放在 ok() 这个全站唯一出口，一处改动覆盖所有页面，不必改 N 个路由。
  *
  * 【为什么必须返回新对象，绝不能就地改】
@@ -146,16 +153,9 @@ function attKeyOf(x) {
   return null;
 }
 
-let _attStore = null;            // 懒加载，避免 http.js 启动时就拉进七牛 SDK
-function attStoreInstance() {
-  if (_attStore !== undefined && _attStore !== null) return _attStore;
-  try {
-    const { AttStore } = require('./attstore');
-    _attStore = new AttStore(process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads'));
-  } catch (e) {
-    _attStore = null;            // 附件存储不可用时静默跳过，绝不阻断业务响应
-  }
-  return _attStore;
+/** 附件预览地址（本机代理，见 routes/ops.js 的 /api/attachment/file） */
+function previewUrlOf(key) {
+  return '/api/attachment/file?key=' + encodeURIComponent(key);
 }
 
 function resignAttUrls(v, depth) {
@@ -167,10 +167,15 @@ function resignAttUrls(v, depth) {
   }
   const key = attKeyOf(v);
   if (key) {
-    let u = null;
-    try { const s = attStoreInstance(); if (s) u = s.url(key); } catch (e) { u = null; }
-    if (u && u !== v.url) return Object.assign({}, v, { url: u });
-    return v;
+    const p = previewUrlOf(key);
+    if (v.url === p) return v;
+    return Object.assign({}, v, { url: p });   // 浅拷贝：绝不动 db 缓存里的原对象
+  }
+  // 合同比对批次里的 { fileKey, fileUrl } 形态（routes/contractcmp.js）同样处理
+  if (typeof v.fileKey === 'string' && v.fileKey) {
+    const p = previewUrlOf(v.fileKey);
+    if (v.fileUrl === p) return v;
+    return Object.assign({}, v, { fileUrl: p });
   }
   let changed = false;
   const out = {};

@@ -7,7 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const { uid, num, now, today, addDays, monthOf, money } = require('../lib/util');
 const { floorNameOf } = require('../lib/billing');
-const { AttStore } = require('../lib/attstore');
+const { AttStore, MIME_BY_EXT } = require('../lib/attstore');
 const OCR = require('../lib/ocr');
 
 module.exports = function (db, router, opt) {
@@ -180,6 +180,54 @@ module.exports = function (db, router, opt) {
       focus: all.filter(w => w.focus).length,
       overdue: all.filter(w => w.status !== '已完成' && w.status !== '已关闭' && w.planDate && w.planDate < today()).length
     });
+  });
+
+  /* ================= 附件在线预览（本机代理） =================
+   * 【为什么必须有这个接口】
+   * 七牛「私有空间」的下载链接**一律返回 `Content-Disposition: attachment`**
+   * （实测：即使在 URL 上附加 response-content-disposition=inline 并让它参与签名，
+   *   七牛仍然返回 attachment，只认自己的默认行为）——浏览器只会下载文件、
+   * 不会内联显示，发票 PDF 的 iframe 在线预览因此失效。
+   * 这里把内容取回来，自己以 `inline` 输出：
+   *   · 浏览器可直接显示 PDF / 图片（用户点「查看」就是打开而非下载）
+   *   · 天然获得鉴权：必须登录才能看，健康证/身份证等敏感件不会裸奔
+   *   · 地址恒定，不像七牛签名链接那样 1 小时过期
+   *
+   * 前端拿到的附件 url 已由 lib/http.js 的 ok() 统一重写指向本接口（见 resignAttUrls）。
+   * 附件实体本身仍在七牛，这里只是取回中转。
+   */
+  router.get('/api/attachment/file', async (req, res) => {
+    if (!needLogin(req, res)) return;
+    const key = String((req.query && req.query.key) || '').trim();
+    if (!key) return fail(res, '缺少附件标识 key');
+    // 防目录穿越：本地模式下 key 会参与拼路径
+    if (key.indexOf('..') >= 0 || key.indexOf('\\') >= 0 || key.charAt(0) === '/' || key.indexOf('\0') >= 0) {
+      return fail(res, '非法的附件标识');
+    }
+    let buf = null;
+    try {
+      buf = await attStore().read(key);
+    } catch (e) {
+      const msg = (e && e.message) || String(e);
+      // 对象不存在时七牛返回 404，翻译成 HTTP 404 更准确
+      if (/404|not found/i.test(msg)) return fail(res, '附件不存在：' + key, 404);
+      return fail(res, '读取附件失败：' + msg, 500);
+    }
+    if (!buf) return fail(res, '附件不存在：' + key, 404);
+
+    const ext = path.extname(key).toLowerCase();
+    const mime = MIME_BY_EXT[ext] || 'application/octet-stream';
+    const dlName = path.basename(key);
+    res.writeHead(200, {
+      'Content-Type': mime,
+      'Content-Length': buf.length,
+      // inline = 内联显示；同时给出文件名，用户「另存为」时名字是对的
+      // （不能带 attachment，否则浏览器又变成下载）
+      'Content-Disposition': 'inline; filename="' + encodeURIComponent(dlName) + '"',
+      // 私有内容不进共享缓存；给浏览器 5 分钟本地缓存，避免翻页时反复回源
+      'Cache-Control': 'private, max-age=300'
+    });
+    res.end(buf);
   });
 
   /* ================= 附件上传 ================= */
