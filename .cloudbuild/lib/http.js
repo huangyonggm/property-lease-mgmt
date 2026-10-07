@@ -133,6 +133,12 @@ function json(res, data, status) {
  * 不会内联显示 —— 发票 PDF 的 iframe 在线预览因此失效。
  * 走本机代理则：① 能内联预览；② 天然鉴权（未登录看不到敏感件）；③ 地址永不失效。
  *
+ * 【本地磁盘附件同样走代理（2026-10-07 补）】
+ * `server.js` 的 serveDir 现在要求 `/uploads/` 与 `/exports/` 必须登录
+ * （原先它们排在 attachUser 之前，是零鉴权直出，实测 /exports/schema.json 未登录 200）。
+ * 但前端是 `<a href="a.url" target="_blank">` 打开的，新窗口的请求带不上 x-token，
+ * 所以 `storage:'local'` 的记录也必须改走这个代理（代理靠 Cookie 鉴权，天然带得上）。
+ *
  * 放在 ok() 这个全站唯一出口，一处改动覆盖所有页面，不必改 N 个路由。
  *
  * 【为什么必须返回新对象，绝不能就地改】
@@ -147,9 +153,16 @@ function attKeyOf(x) {
   if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
   if (typeof x.key !== 'string' || !x.key) return null;
   if (x.storage === 'qiniu') return x.key;
+  // 本地磁盘附件也一并改走代理。
+  // 【为什么】`/uploads/` 现在要求登录（serveDir 里加了 req.user 校验），
+  // 而前端是 `<a href="a.url" target="_blank">` 直接打开的 —— 新窗口里的
+  // 请求带不上 token，直链必然 401。统一改走 /api/attachment/file（走 Cookie 鉴权）最省事。
+  if (x.storage === 'local') return x.key;
   // 老记录没有 storage 字段：url 里带七牛域名（含被注释污染的脏域名，前缀仍能命中）也算
   const dom = process.env.QINIU_DOMAIN || '';
   if (dom && typeof x.url === 'string' && x.url.indexOf(dom) >= 0) return x.key;
+  // 兜底：本地 /uploads/ 开头的老记录（同样没有 storage 字段）
+  if (typeof x.url === 'string' && x.url.indexOf('/uploads/') === 0) return x.key;
   return null;
 }
 

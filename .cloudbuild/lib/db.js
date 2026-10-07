@@ -47,9 +47,59 @@ class DB {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     this.cache = new Map();
     this.seq = new Map();
+    // 启动时清理历史堆积的备份。原来 persist 只写不删，实测一天多就堆到
+    // data/ 目录 225 个文件里 185 个是 .bak（最大单个 3.7MB）。
+    try {
+      const r = this.pruneBackups();
+      if (r.removed) console.log('[DB] 已清理 ' + r.removed + ' 个历史备份（每表保留最近 ' + r.keep + ' 份）');
+    } catch (e) { /* 清理失败不影响启动 */ }
   }
 
   file(name) { return path.join(this.dir, String(name).replace(/[^\w\u4e00-\u9fa5-]/g, '_') + '.json'); }
+
+  /**
+   * 每个表保留最近 N 份 `.bak.<时间戳>`，更老的删掉。
+   *
+   * 【为什么需要】`persist()` 每次写入前都会 copy 一份 `.bak.<Date.now()>`，
+   * 而**从来没有清理**。附件/收费/考勤这类高频表一天就能刷出几十上百个备份：
+   * 实测 data/ 共 225 个文件，其中 185 个是 .bak。它们既占磁盘，
+   * 又让 `ls data/` 完全看不出真正的业务表有多少张。
+   *
+   * 上限定在 10 份而不是按天：本系统的写入是「每次业务操作落一次盘」，
+   * 按份数保留既能覆盖「连续几次写坏了还能回退」，又不会无限增长。
+   * 可用 `BAK_KEEP` 环境变量覆盖。
+   */
+  pruneBackups(keep) {
+    keep = Number(keep || process.env.BAK_KEEP || 10);
+    if (!(keep > 0)) return { removed: 0, keep: 0 };
+    let removed = 0;
+    let names = [];
+    try { names = fs.readdirSync(this.dir); } catch (e) { return { removed: 0, keep: keep }; }
+    // 只处理「<表>.json」的主文件对应的备份，避免误伤 .corrupt. 这类取证文件
+    for (const n of names) {
+      if (n.slice(-5) === '.json') removed += this._pruneTable(n, keep, names);
+    }
+    return { removed: removed, keep: keep };
+  }
+
+  /** 单个表的备份清理；names 可传入避免重复 readdir。返回删除个数 */
+  _pruneTable(baseFile, keep, names) {
+    if (!names) { try { names = fs.readdirSync(this.dir); } catch (e) { return 0; } }
+    const base = baseFile + '.bak.';
+    const baks = [];
+    for (const m of names) {
+      if (m.indexOf(base) !== 0) continue;
+      const ts = Number(m.slice(base.length));
+      baks.push({ m: m, ts: isNaN(ts) ? 0 : ts });
+    }
+    if (baks.length <= keep) return 0;
+    baks.sort((a, b) => b.ts - a.ts);             // 新 → 旧
+    let removed = 0;
+    for (let i = keep; i < baks.length; i++) {
+      try { fs.unlinkSync(path.join(this.dir, baks[i].m)); removed++; } catch (e) { }
+    }
+    return removed;
+  }
 
   load(name) {
     if (this.cache.has(name)) return this.cache.get(name);
@@ -104,7 +154,16 @@ class DB {
       try {
         const st = fs.statSync(f);
         // 只在有实质内容时才备份，避免空文件刷出一堆 .bak
-        if (st.size > 0) fs.copyFileSync(f, f + '.bak.' + Date.now());
+        if (st.size > 0) {
+          fs.copyFileSync(f, f + '.bak.' + Date.now());
+          // 运行期也要收着点：每攒够 keep 份才扫一次目录（不必每次写盘都 readdir）
+          if (!this._bakTick) this._bakTick = new Map();
+          const tick = (this._bakTick.get(name) || 0) + 1;
+          if (tick >= Number(process.env.BAK_KEEP || 10)) {
+            this._bakTick.set(name, 0);
+            this._pruneTable(path.basename(f), Number(process.env.BAK_KEEP || 10));
+          } else this._bakTick.set(name, tick);
+        }
       } catch (e2) { }
     }
     fs.writeFileSync(tmp, JSON.stringify(arr), 'utf8');

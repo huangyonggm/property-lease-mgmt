@@ -205,15 +205,33 @@ module.exports = function (db, router, opt) {
       return fail(res, '非法的附件标识');
     }
     let buf = null;
+    const att = attStore();
+    let primaryErr = null;
     try {
-      buf = await attStore().read(key);
+      buf = await att.read(key);
     } catch (e) {
-      const msg = (e && e.message) || String(e);
-      // 对象不存在时七牛返回 404，翻译成 HTTP 404 更准确
-      if (/404|not found/i.test(msg)) return fail(res, '附件不存在：' + key, 404);
-      return fail(res, '读取附件失败：' + msg, 500);
+      primaryErr = (e && e.message) || String(e);
     }
-    if (!buf) return fail(res, '附件不存在：' + key, 404);
+    // 兜底：本地磁盘 uploads/。
+    // 两种场景：① 主存储是七牛，但库里还有历史遗留的 storage:'local' 记录；
+    //          ② 七牛临时不可用（欠费/密钥轮换），而 uploads/ 里恰好有副本。
+    // 路径经 normalize 后必须仍在 uploadDir 内 —— 与 serveDir 同一条防穿越规则。
+    if (!buf && uploadDir) {
+      try {
+        const fp = path.join(uploadDir, String(key).replace(/[\\/]+/g, path.sep));
+        if (fp.indexOf(uploadDir) === 0 && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
+          buf = fs.readFileSync(fp);
+        }
+      } catch (e2) { /* 忽略，落到下面的统一错误分支 */ }
+    }
+    if (!buf) {
+      // 主存储明确报「对象不存在」→ 404；否则是读取本身出错 → 500
+      // （别把「七牛挂了」说成「文件没了」，否则排查方向会被带偏）
+      if (primaryErr && !/404|not found/i.test(primaryErr)) {
+        return fail(res, '读取附件失败：' + primaryErr, 500);
+      }
+      return fail(res, '附件不存在：' + key, 404);
+    }
 
     const ext = path.extname(key).toLowerCase();
     const mime = MIME_BY_EXT[ext] || 'application/octet-stream';
@@ -283,6 +301,41 @@ module.exports = function (db, router, opt) {
     if (!needLogin(req, res)) return;
     const q = req.query;
     ok(res, (await db.where('attachments', a => (!q.bizType || a.bizType === q.bizType) && (!q.bizId || a.bizId === q.bizId))));
+  });
+
+  /* ================= 附件删除 =================
+   * 【为什么必须有】原先只有「上传」和「列表」两个接口，全项目**没有任何地方**
+   * 调用 AttStore.del() —— 结果就是：传错的附件既删不掉（只能手改 data/attachments.json），
+   * 七牛上的对象还会变成孤儿永久占着存储、并且没人知道它属于谁。
+   *
+   * 【顺序为什么是先实体后记录】反过来的最坏情况是「记录没了、实体还在」——
+   * 对象变孤儿且再也找不到 key，无从清理；按这个顺序最坏只是
+   * 「实体没了、记录还在」，用户再点一次删除即可自愈。
+   *
+   * 【权限为什么只给 system:manage】
+   * 本来想做成「管理员 或 上传者本人」。但「上传者本人」需要一个稳定的 byUserId，
+   * 而 attachments 表**没有这一列**；补列要走三步（schema.json 的 cols →
+   * 线上 TiDB ALTER → schema.sql），而 `lib/clouddb.js` 的 `assertCols()` 是
+   * **静默 filter**（不在 COLS 里就悄悄丢掉），漏一步就会无声无息地不落库。
+   * 目前全站只有 7 条附件、十来个人用，为这个做一次双库迁移不划算 ——
+   * 所以先只给系统管理权限。等附件量上来再补 byUserId 三步走。
+   */
+  router.del('/api/system/attachments/:id', async (req, res) => {
+    if (!can(req, res, 'system:manage')) return;
+    const rec = await db.find('attachments', req.params.id);
+    if (!rec) return fail(res, '附件记录不存在', 404);
+
+    let delErr = null;
+    if (rec.key) {
+      try { await attStore().del(rec.key); }
+      catch (e) { delErr = (e && e.message) || String(e); }
+    }
+    if (delErr) return fail(res, '实体删除失败，记录已保留（可重试）：' + delErr, 500);
+
+    await db.remove('attachments', req.params.id);
+    audit.routeLog(db, req, '系统设置', '删除附件',
+      { detail: (rec.name || '') + ' / ' + (rec.key || '') });
+    ok(res, { id: req.params.id, key: rec.key || null, storage: rec.storage || '' });
   });
 
   /* ================= 操作日志 ================= */

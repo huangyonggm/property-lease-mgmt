@@ -581,14 +581,32 @@
           load();
         } else if (cur === 'file') {
           const r = await GET('/api/system/attachments');
+          const rows = r.data || [];
           box.innerHTML = '<div class="card"><div class="card-head"><h3>附件管理</h3><span class="spacer"></span>' +
             '<button class="btn btn-sm" id="upFile">上传附件</button></div><div class="card-body">' +
             '<div class="muted mb8">合同扫描件、身份证、营业执照、现场巡检照片、CAD 图纸统一存储。</div>' +
             Table.render([{ title: '文件名', key: 'name' }, { title: '业务类型', key: 'bizType', width: 100 },
             { title: '大小(KB)', key: 'size', width: 90, num: true }, { title: '上传人', key: 'by', width: 90 },
             { title: '时间', key: 'time', width: 150 },
-            { title: '操作', key: 'url', render: r => '<a class="btn btn-sm" href="' + U.esc(r.url) + '" target="_blank">查看</a>' }], r.data || []) +
+            {
+              title: '操作', key: 'url', width: 130, render: x =>
+                '<a class="btn btn-sm" href="' + U.esc(x.url) + '" target="_blank">查看</a> ' +
+                '<button class="btn btn-sm btn-danger" data-del="' + U.esc(x.id) + '">删除</button>'
+            }], rows) +
             '</div></div>';
+          // 删除：云端对象与本地镜像由后端一并清掉，前端只负责确认
+          box.querySelectorAll('[data-del]').forEach(b => {
+            b.onclick = async () => {
+              const id = b.getAttribute('data-del');
+              const rec = rows.filter(x => String(x.id) === String(id))[0] || {};
+              const yes = await UI.confirm(
+                '确定删除附件「' + (rec.name || id) + '」吗？\n\n云端对象与服务器本地镜像会一并删除，不可恢复。', '删除确认');
+              if (!yes) return;
+              const rr = await DEL('/api/system/attachments/' + encodeURIComponent(id));
+              UI.toast(rr.ok ? '已删除' : (rr.msg || '删除失败'), rr.ok ? 'ok' : 'err');
+              if (rr.ok) renderTab();
+            };
+          });
           box.querySelector('#upFile').onclick = () => {
             const inp = document.createElement('input');
             inp.type = 'file'; inp.multiple = true;

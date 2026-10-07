@@ -383,10 +383,26 @@ require('./routes/hr')(db, router, ctx);
 require('./routes/patrol')(db, router, ctx);
 require('./routes/income')(db, router, ctx);
 
-/* ---------- 上传/导出文件访问 ---------- */
+/* ---------- 上传/导出文件访问 ----------
+ *
+ * ⚠⚠ 这两个前缀曾经注册在 `A.attachUser(db)` **之前**，等于**零鉴权直出**。
+ * 实测（2026-10-07）：`GET /exports/schema.json` 未登录返回 **200**，
+ * 而 `/api/system/attachments` 未登录是 401 —— 证明静态目录完全绕过了登录。
+ *
+ * 危害集中在 `/exports/`：报表导出是「服务端留档」语义（`routes/report.js` 的
+ * `/api/report/files` 会把文件列出来、下载后**不删**），而 `routes/hr.js` 导出的
+ * **全员薪资**、`routes/report.js` 导出的客户台账/合同清单/收费台账全部落在这个目录，
+ * 文件名又是 `客户台账_2026-10-07.xls` 这种**可猜的日期戳** ——
+ * 任何人不用登录就能把薪资表和客户台账拖走。
+ *
+ * 修法：① `attachUser` 挪到 serveDir **之前**；② serveDir 命中前缀后强制登录。
+ * 只保护这两个目录，不动其它任何路由。
+ */
 function serveDir(prefix, dir) {
   return async function (req, res) {
     if (req.path.indexOf(prefix) !== 0) return true;
+    // 登录校验放在「命中前缀」之后：非本目录的请求原样放行，零额外开销
+    if (!req.user) return fail(res, '未登录或登录已失效', 401);
     const rel = req.path.slice(prefix.length);
     const fp = path.join(dir, decodeURIComponent(rel).replace(/^([/\\])+/, ''));
     if (fp.indexOf(dir) !== 0 || !fs.existsSync(fp) || !fs.statSync(fp).isFile()) {
@@ -401,9 +417,11 @@ const server = createServer(router, {
   staticDir: PUBLIC_DIR,
   db: db,                          // 云端模式下启用请求级缓存（本地 db 无此方法，自动跳过）
   before: [
+    // attachUser 必须排在 serveDir 之前 —— serveDir 靠 req.user 判登录，
+    // 顺序反了就等于没鉴权（这正是原来那个洞）
+    A.attachUser(db),
     serveDir('/uploads/', UPLOAD_DIR),
-    serveDir('/exports/', EXPORT_DIR),
-    A.attachUser(db)
+    serveDir('/exports/', EXPORT_DIR)
   ]
 });
 
