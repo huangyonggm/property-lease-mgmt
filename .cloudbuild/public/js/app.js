@@ -59,14 +59,14 @@
     const menus = App.menus.length ? App.menus : FALLBACK_MENUS;
     document.getElementById('app').innerHTML =
       '<div class="layout">' +
-      '<aside class="sidebar"><div class="brand"><div class="logo">租</div><div>物业租赁系统<small>不动产租赁全流程管理</small></div></div>' +
+      '<aside class="sidebar"><div class="brand"><div class="logo">梦</div><div class="bname">梦想之城物业管理系统<small>不动产租赁全流程管理</small></div></div>' +
       '<nav class="menu">' +
       '<div class="menu-group">业务模块</div>' +
       menus.map(m => '<div class="menu-item" data-key="' + m.key + '" onclick="location.hash=\'' + (m.path || ('#/' + m.key)) + '\'">' +
         '<span class="ic">' + (ICON[m.key] || '▪') + '</span>' + U.esc(m.name) + '</div>').join('') +
       '</nav></aside>' +
       '<div class="main"><header class="topbar">' +
-      '<div><div class="title" id="pageTitle">驾驶舱</div><div class="crumb">物业不动产租赁管理系统</div></div>' +
+      '<div><div class="title" id="pageTitle">驾驶舱</div><div class="crumb">梦想之城物业管理系统</div></div>' +
       '<span class="spacer"></span>' +
       '<span class="bell" id="bellBtn" title="提醒中心">🔔<span class="dot" id="bellDot" style="display:none">0</span></span>' +
       '<span class="user-chip" id="userChip"><span class="avatar">' + U.esc((u.name || 'U').slice(0, 1)) + '</span>' +
