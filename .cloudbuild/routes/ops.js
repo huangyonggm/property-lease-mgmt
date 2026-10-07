@@ -394,7 +394,14 @@ module.exports = function (db, router, opt) {
   router.get('/api/system/stats', async (req, res) => {
     if (!can(req, res, 'system:view')) return;
     const stats = db.stats();
-    ok(res, { collections: stats, dbPath: opt.dataDir, uploadDir: uploadDir });
+    // 附件存储概况：主存储（七牛/本地）+ 本地镜像占用。
+    // 镜像的意义是「七牛挂了手里还有一份」，运维需要能看到它到底存了多少、有没有生效。
+    const att = attStore();
+    ok(res, {
+      collections: stats, dbPath: opt.dataDir, uploadDir: uploadDir,
+      attachmentStorage: att.mode,
+      mirror: att.mirrorStats()
+    });
   });
 
   router.post('/api/system/backup', async (req, res) => {

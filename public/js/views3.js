@@ -677,10 +677,18 @@
         } else {
           const r = await GET('/api/system/stats');
           const d = r.data || {};
+          // 字节数转人话；附件主存储是七牛还是本机、本地镜像占了多少，运维要一眼看到
+          const mb = b => (b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1024).toFixed(0) + ' KB');
+          const mir = d.mirror;
+          const mirTxt = mir
+            ? (mir.dir + '（' + mir.files + ' 个文件 / ' + mb(mir.bytes) + (mir.exists ? '' : '，目录尚未创建') + '）')
+            : '未启用（设 ATT_MIRROR_DIR 后新上传自动双写）';
           box.innerHTML = '<div class="card"><div class="card-head"><h3>系统概况</h3><span class="spacer"></span>' +
             '<button class="btn btn-sm" id="doBackup">立即备份数据</button></div><div class="card-body">' +
             '<div class="kv"><div class="k">数据目录</div><div class="mono">' + U.esc(d.dbPath || '') + '</div>' +
-            '<div class="k">附件目录</div><div class="mono">' + U.esc(d.uploadDir || '') + '</div></div>' +
+            '<div class="k">附件目录</div><div class="mono">' + U.esc(d.uploadDir || '') + '</div>' +
+            '<div class="k">附件主存储</div><div class="mono">' + U.esc(d.attachmentStorage === 'qiniu' ? '七牛云 Kodo' : '本机 uploads/') + '</div>' +
+            '<div class="k">附件本地镜像</div><div class="mono">' + U.esc(mirTxt) + '</div></div>' +
             '<h4 class="mt12 mb8">数据集合统计</h4>' +
             Table.render([{ title: '集合', key: 'k' }, { title: '记录数', key: 'v', num: true }],
               Object.keys(d.collections || {}).map(k => ({ k: k, v: d.collections[k] }))) +

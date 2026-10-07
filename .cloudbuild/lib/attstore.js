@@ -53,6 +53,34 @@ function useQiniu() {
   return String(process.env.ATT_STORAGE || '').toLowerCase() === 'qiniu';
 }
 
+/**
+ * 本地镜像目录。
+ *
+ * 【为什么要有「镜像」这一层】
+ * 七牛是附件唯一的实体存放处 → 一旦欠费 / 密钥轮换 / 服务抖动，
+ * 全站附件（健康证、身份证、合同扫描件、发票）立刻集体打不开，
+ * 而库里只剩一个 key，自己手上什么也没有。镜像就是「自己手里也留一份」。
+ *
+ * 【为什么不能镜像到 uploads/】
+ * ⚠ 这是本次的关键决定。`server.js` 里 `/uploads/` 是 `before` 中间件中的
+ * `serveDir('/uploads/', UPLOAD_DIR)`，它**排在 `A.attachUser()` 之前** ——
+ * 也就是说 /uploads/<文件名> 是**零鉴权**直接吐文件的。
+ * 把健康证、身份证镜像进去 = 把「必须登录才能看」的敏感件
+ * 降级成「知道文件名就能下载」，等于亲手拆掉鉴权。
+ * 所以镜像目录必须是一个**不被任何 serveDir 覆盖**的独立目录，
+ * 读取一律走已鉴权的 /api/attachment/file 代理。
+ *
+ * 由 ATT_MIRROR_DIR 启用（不设 = 不镜像，保持原行为）。
+ */
+function mirrorBase() {
+  const d = String(process.env.ATT_MIRROR_DIR || '').split('#')[0].trim();
+  return d ? path.resolve(d) : null;
+}
+
+function useMirror() {
+  return useQiniu() && !!mirrorBase();
+}
+
 let _qiniu = null;
 function getQiniu() {
   if (_qiniu) return _qiniu;
@@ -211,6 +239,81 @@ class AttStore {
   constructor(uploadDir) {
     this.uploadDir = uploadDir || path.join(__dirname, '..', 'uploads');
     this.mode = useQiniu() ? 'qiniu' : 'local';
+    // 本地镜像目录（ATT_MIRROR_DIR）；null = 不镜像，保持原行为
+    this.mirrorDir = useMirror() ? mirrorBase() : null;
+  }
+
+  /* ================= 本地镜像 =================
+   *
+   * 【为什么要镜像】七牛是附件唯一实体存放处，欠费 / 密钥轮换 / 服务抖动
+   * 会让全站附件（健康证、身份证、合同扫描件、发票）集体打不开，而自己手上什么都没有。
+   *
+   * 【为什么绝不镜像到 uploads/】`server.js` 里 `/uploads/` 由 `before` 中间件
+   * `serveDir('/uploads/', UPLOAD_DIR)` 直出，**排在 `A.attachUser()` 之前**，即
+   * 零鉴权 —— 任何知道文件名的人都能下载。把敏感件镜像进去等于亲手拆掉鉴权。
+   * 所以镜像目录必须不被任何 serveDir 覆盖，读取只走已鉴权的 /api/attachment/file。
+   */
+
+  /** key → 镜像目录下的绝对路径；key 非法（穿越）时返回 null */
+  mirrorPath(key) {
+    if (!this.mirrorDir) return null;
+    const safe = String(key || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!safe || safe.indexOf('..') >= 0 || safe.indexOf('\0') >= 0) return null;
+    const fp = path.join(this.mirrorDir, safe.replace(/\//g, path.sep));
+    if (fp !== this.mirrorDir && fp.indexOf(this.mirrorDir + path.sep) !== 0) return null;
+    return fp;
+  }
+
+  /** 写镜像。**任何失败都只 warn，绝不向上抛** —— 镜像坏了不能连带把上传搞失败 */
+  mirrorWrite(key, buffer) {
+    const fp = this.mirrorPath(key);
+    if (!fp) return false;
+    try {
+      const dir = path.dirname(fp);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      // 先写 .tmp 再 rename：避免读取方读到写了一半的文件
+      // mode 0600：镜像里是健康证/身份证/合同扫描件这类敏感件，
+      // 目录已经是 0700，文件再收一道，防止日后目录权限被放松时连带泄露
+      const tmp = fp + '.tmp.' + process.pid;
+      fs.writeFileSync(tmp, buffer, { mode: 0o600 });
+      fs.renameSync(tmp, fp);
+      return true;
+    } catch (e) {
+      console.warn('[attstore] 镜像写入失败（不影响主上传）：' + key + ' → ' + (e && e.message));
+      return false;
+    }
+  }
+
+  mirrorRead(key) {
+    const fp = this.mirrorPath(key);
+    if (!fp || !fs.existsSync(fp)) return null;
+    try { return fs.readFileSync(fp); } catch (e) { return null; }
+  }
+
+  /** 删镜像；本来就不存在也算成功 */
+  mirrorDelete(key) {
+    const fp = this.mirrorPath(key);
+    if (!fp || !fs.existsSync(fp)) return true;
+    try { fs.unlinkSync(fp); return true; }
+    catch (e) { console.warn('[attstore] 镜像删除失败：' + key + ' → ' + (e && e.message)); return false; }
+  }
+
+  /** 镜像占用统计（系统概况页展示用）；未启用镜像时返回 null */
+  mirrorStats() {
+    if (!this.mirrorDir) return null;
+    let files = 0, bytes = 0;
+    const walk = d => {
+      let ents = [];
+      try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+      for (const e of ents) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else { try { files++; bytes += fs.statSync(p).size; } catch (x) { /* 跳过 */ } }
+      }
+    };
+    const exists = fs.existsSync(this.mirrorDir);
+    if (exists) walk(this.mirrorDir);
+    return { dir: this.mirrorDir, files, bytes, exists };
   }
 
   /** 写入附件，返回 { key, url, name, size, mime, storage } */
@@ -221,10 +324,13 @@ class AttStore {
 
     if (this.mode === 'qiniu') {
       await qiniuUpload(key, buffer);
+      // 双写：云端成功后同步落一份本地镜像（ATT_MIRROR_DIR 未设则跳过）
+      if (this.mirrorDir) this.mirrorWrite(key, buffer);
       await qiniuProto();          // 先探测协议，再生成 URL，避免签出不可用的 https 地址
       return {
         key, name: path.basename(key), size: buffer.length, mime,
-        url: qiniuUrl(key), storage: 'qiniu'
+        url: qiniuUrl(key), storage: 'qiniu',
+        mirrored: !!this.mirrorDir
       };
     }
     const fp = path.join(this.uploadDir, key.replace(/\//g, path.sep));
@@ -245,7 +351,13 @@ class AttStore {
   }
 
   async del(key) {
-    if (this.mode === 'qiniu') { await qiniuDelete(key); return true; }
+    if (this.mode === 'qiniu') {
+      let cloudErr = null;
+      try { await qiniuDelete(key); } catch (e) { cloudErr = e; }
+      this.mirrorDelete(key);     // 云端删成功与否，本地副本都跟着清掉，避免留孤儿
+      if (cloudErr) throw cloudErr;
+      return true;
+    }
     const fp = path.join(this.uploadDir, String(key).replace(/\//g, path.sep));
     if (!fp.startsWith(this.uploadDir)) return false;
     if (!fs.existsSync(fp)) return false;
@@ -253,14 +365,25 @@ class AttStore {
     return true;
   }
 
-  /** 读回内容（导出/下载用） */
+  /**
+   * 读回内容（预览代理 / 导出用）。
+   *
+   * 【顺序】本地镜像优先 → 未命中再回源七牛 → 回源成功顺手回填镜像。
+   * 三个好处：① 预览走本机磁盘，省一次外网往返（3.5MB 的工单照片差别明显）；
+   * ② 七牛抖动/欠费时附件照样能打开；③ 老附件首次被访问就自动补齐镜像。
+   */
   async read(key) {
+    const local = this.mirrorRead(key);
+    if (local) return local;
+
     if (this.mode === 'qiniu') {
       await qiniuProto();          // 同 put：先确保 URL 协议正确
       const u = qiniuUrl(key);
       const r = await fetch(u);
       if (!r.ok) throw new Error('从对象存储读取失败：' + r.status);
-      return Buffer.from(await r.arrayBuffer());
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (this.mirrorDir) this.mirrorWrite(key, buf);   // 回填；失败只 warn
+      return buf;
     }
     const fp = path.join(this.uploadDir, String(key).replace(/\//g, path.sep));
     if (!fs.existsSync(fp)) return null;
@@ -268,4 +391,4 @@ class AttStore {
   }
 }
 
-module.exports = { AttStore, MIME_BY_EXT, useQiniu };
+module.exports = { AttStore, MIME_BY_EXT, useQiniu, useMirror, mirrorBase };
